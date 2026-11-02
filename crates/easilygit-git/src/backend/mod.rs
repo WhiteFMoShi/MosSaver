@@ -1,4 +1,5 @@
 mod commands;
+mod history;
 mod restore;
 mod snapshot;
 mod status;
@@ -98,7 +99,10 @@ impl ProjectPort for SystemGitBackend {
     }
 
     fn checkpoints(&self, root: &Path) -> AppResult<Vec<Checkpoint>> {
-        let (_, mut metadata) = self.load_metadata(root)?;
+        let (metadata_path, mut metadata) = self.load_metadata(root)?;
+        if history::update_existing_history(root, &mut metadata)? {
+            self.save_metadata(&metadata_path, &metadata)?;
+        }
         let mut valid_checkpoints = Vec::with_capacity(metadata.checkpoints.len());
         for checkpoint in metadata.checkpoints {
             if commands::reference_exists(root, &checkpoint.id)? {

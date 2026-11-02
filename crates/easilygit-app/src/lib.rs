@@ -42,7 +42,12 @@ impl<P: ProjectPort> ProjectService<P> {
             .port
             .repository_root(&selected)?
             .ok_or(AppError::NotARepository)?;
-        if self.port.checkpoints(&root)?.is_empty() {
+        if !self
+            .port
+            .checkpoints(&root)?
+            .iter()
+            .any(|checkpoint| checkpoint.kind == CheckpointKind::User)
+        {
             self.port.create_checkpoint(&root, "项目初始版本", false)?;
         }
         self.state_for_root(root)
@@ -89,6 +94,7 @@ impl<P: ProjectPort> ProjectService<P> {
             Some(repository_root) => self.port.is_protected(repository_root)?,
             None => false,
         };
+        let is_git_repository = repository_root.is_some();
         let root = repository_root.unwrap_or(root);
         let name = root
             .file_name()
@@ -101,6 +107,7 @@ impl<P: ProjectPort> ProjectService<P> {
                 root: root.to_string_lossy().into_owned(),
                 name,
                 initialized: false,
+                is_git_repository,
                 current_changes: Vec::new(),
                 checkpoints: Vec::new(),
                 can_undo_restore: false,
@@ -111,13 +118,14 @@ impl<P: ProjectPort> ProjectService<P> {
             .port
             .checkpoints(&root)?
             .into_iter()
-            .filter(|checkpoint| checkpoint.kind == CheckpointKind::User)
+            .filter(|checkpoint| checkpoint.kind != CheckpointKind::Automatic)
             .collect();
 
         Ok(ProjectState {
             root: root.to_string_lossy().into_owned(),
             name,
             initialized: true,
+            is_git_repository,
             current_changes: self.port.current_changes(&root)?,
             checkpoints,
             can_undo_restore: self.port.can_undo_restore(&root)?,

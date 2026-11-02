@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { onMount } from "svelte";
 
   type ChangeKind = "added" | "modified" | "deleted";
 
@@ -13,13 +15,14 @@
     id: string;
     label: string;
     createdAt: string;
-    kind: "user" | "automatic";
+    kind: "user" | "git" | "automatic";
   }
 
   interface ProjectState {
     root: string;
     name: string;
     initialized: boolean;
+    isGitRepository: boolean;
     currentChanges: ChangedFile[];
     checkpoints: Checkpoint[];
     canUndoRestore: boolean;
@@ -30,6 +33,31 @@
   let errorMessage = $state("");
   let selectedCheckpoint = $state<Checkpoint | null>(null);
   let dialogMode = $state<"restore" | "undo" | null>(null);
+  let autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingRefreshRoot: string | undefined;
+
+  onMount(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    listen<string>("project-files-changed", (event) => {
+      scheduleProjectRefresh(event.payload);
+    })
+      .then((stopListening) => {
+        if (disposed) stopListening();
+        else unlisten = stopListening;
+      })
+      .catch(() => {
+        errorMessage = "自动刷新暂不可用，你仍可以点击“刷新”查看最新状态。";
+      });
+
+    return () => {
+      disposed = true;
+      if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+      unlisten?.();
+      void invoke("stop_project_watch").catch(() => {});
+    };
+  });
 
   const changeLabels: Record<ChangeKind, string> = {
     added: "新增",
@@ -60,16 +88,24 @@
 
   async function openProject(path: string) {
     await perform(async () => {
-      project = await invoke<ProjectState>("open_project", { path });
+      const opened = await invoke<ProjectState>("open_project", { path });
+      project = opened;
       selectedCheckpoint = null;
       dialogMode = null;
+      if (opened.initialized) {
+        await invoke("watch_project", { path: opened.root });
+      } else {
+        await invoke("stop_project_watch");
+      }
     });
   }
 
   async function initializeProject() {
     if (!project) return;
     await perform(async () => {
-      project = await invoke<ProjectState>("initialize_project", { path: project!.root });
+      const initialized = await invoke<ProjectState>("initialize_project", { path: project!.root });
+      project = initialized;
+      await invoke("watch_project", { path: initialized.root });
     });
   }
 
@@ -111,6 +147,32 @@
     });
   }
 
+  function returnHome() {
+    project = null;
+    errorMessage = "";
+    selectedCheckpoint = null;
+    dialogMode = null;
+    pendingRefreshRoot = undefined;
+    void invoke("stop_project_watch").catch(() => {});
+  }
+
+  function scheduleProjectRefresh(root: string) {
+    if (!project?.initialized || project.root !== root) return;
+    if (loading) {
+      pendingRefreshRoot = root;
+      return;
+    }
+    if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+    autoRefreshTimer = setTimeout(() => {
+      autoRefreshTimer = undefined;
+      if (loading) {
+        pendingRefreshRoot = root;
+      } else if (project?.initialized && project.root === root) {
+        void refreshProject();
+      }
+    }, 200);
+  }
+
   function requestUndoRestore() {
     selectedCheckpoint = null;
     dialogMode = "undo";
@@ -125,6 +187,11 @@
       errorMessage = friendlyError(error);
     } finally {
       loading = false;
+      if (pendingRefreshRoot) {
+        const root = pendingRefreshRoot;
+        pendingRefreshRoot = undefined;
+        scheduleProjectRefresh(root);
+      }
     }
   }
 
@@ -174,7 +241,7 @@
 
 <main class="app-shell">
   <header class="topbar">
-    <a class="brand" href="/" aria-label="EasilyGit 首页" onclick={(event) => { event.preventDefault(); project = null; errorMessage = ""; selectedCheckpoint = null; dialogMode = null; }}>
+    <a class="brand" href="/" aria-label="EasilyGit 首页" onclick={(event) => { event.preventDefault(); returnHome(); }}>
       <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
       <span>Easily<span class="brand-light">Git</span></span>
     </a>
@@ -234,11 +301,15 @@
           <div class="setup-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.7 20 8v8l-8 4.3L4 16V8l8-4.3Z" /><path d="m4.4 8.2 7.6 4.1 7.6-4.1M12 12.4v7.4M8 5.9l8 4.3" /></svg></div>
           <div class="setup-copy">
             <p class="eyebrow">只需一步</p>
-            <h2>为这个文件夹开启版本保护</h2>
-            <p>开启后，你可以保存项目当前状态，并在需要时恢复。EasilyGit 会在项目中创建本地记录，不会上传任何文件。</p>
+            <h2>{project.isGitRepository ? "检测到已有 Git 仓库" : "为这个文件夹开启版本保护"}</h2>
+            {#if project.isGitRepository}
+              <p>开启后，已有 Git 提交会加入时间线，并保存项目当前状态。EasilyGit 不会移动分支或改动暂存区。</p>
+            {:else}
+              <p>开启后，你可以保存项目当前状态，并在需要时恢复。EasilyGit 会在项目中创建本地 Git 记录，不会上传任何文件。</p>
+            {/if}
           </div>
           <button class="button button-primary" onclick={initializeProject} disabled={loading}>
-            {loading ? "正在准备…" : "开启版本保护"}
+            {loading ? "正在准备…" : project.isGitRepository ? "读取 Git 历史并开启保护" : "开启版本保护"}
             <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5" /></svg>
           </button>
         </section>
@@ -304,7 +375,7 @@
             <div class="panel-heading">
               <div>
                 <h2>已保存的版本</h2>
-                <p>需要时可以恢复到之前的状态</p>
+                <p>EasilyGit 版本与已有 Git 提交都在这里查看和恢复</p>
               </div>
               <span class="history-total">{project.checkpoints.length} 个版本</span>
             </div>
@@ -326,6 +397,7 @@
                         {#if index === 0}<span class="latest-badge">最近</span>{/if}
                       </div>
                       <p class="timeline-time">{formatTime(checkpoint.createdAt)}</p>
+                      {#if checkpoint.kind === "git"}<span class="automatic-note">Git 提交</span>{/if}
                       {#if checkpoint.kind === "automatic"}<span class="automatic-note">自动安全保存</span>{/if}
                       <button class="restore-link" onclick={() => { selectedCheckpoint = checkpoint; dialogMode = "restore"; }} disabled={loading}>
                         <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8a6 6 0 1 1-.2 3M4 4.5V8h3.5M10 7v3l2 1.2" /></svg>

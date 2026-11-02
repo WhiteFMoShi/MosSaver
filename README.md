@@ -1,6 +1,6 @@
 # EasilyGit
 
-EasilyGit is a small desktop app for people who want safe, easy-to-understand versions of a project without learning Git commands. The first version is local only: choose a folder, save a version, and restore it when you need to go back.
+EasilyGit is a small desktop app for people who want safe, easy-to-understand versions of a project without learning Git commands. Choose a folder to view its existing Git history, save a version, and restore it when you need to go back. The app keeps existing branches and the staging area untouched, and watches the selected folder for file changes.
 
 ## Run locally
 

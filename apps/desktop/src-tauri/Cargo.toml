@@ -22,6 +22,7 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+notify = "8"
 serde.workspace = true
 easilygit-app = { path = "../../../crates/easilygit-app" }
 easilygit-domain = { path = "../../../crates/easilygit-domain" }

@@ -17,15 +17,19 @@ Svelte UI
 
 The app creates ordinary Git objects without moving the user's current branch or changing the user's staging area. Each version points to a tree containing tracked files and non-ignored files in the folder. A separate temporary Git index is used while making or comparing a version.
 
-EasilyGit keeps its small metadata file at `.git/easilygit/metadata.json` and version references under `.git/refs/easilygit/checkpoints/`. The project files are not copied into a separate database, and nothing is uploaded.
+When protection is enabled in an existing repository, EasilyGit adds commits reachable from `HEAD`, local branches, remote-tracking branches, and tags to the timeline. It labels those entries as Git commits and can restore their file contents. It reads local Git data only; it does not fetch from remotes. New commits and moved refs are discovered automatically when Git metadata changes.
+
+EasilyGit keeps its small metadata file at `.git/easilygit/metadata.json` and its own version references under `.git/refs/easilygit/checkpoints/`. Imported Git commits get references in the same EasilyGit namespace so they remain available to the timeline. The project files are not copied into a separate database, and nothing is uploaded.
+
+Restoring an EasilyGit version or an imported Git commit writes its files into the working folder. It does not check out a branch or change the user's Git index. The timeline is a simple chronological list; it does not display branch lanes or provide branch and merge controls.
 
 Ignored files are excluded from versions and left alone during restore. Before restoring, EasilyGit saves the current contents as an automatic safety version. The “撤销恢复” action returns to that saved state. Automatic safety versions stay out of the normal version list.
 
-Version data grows with project changes. Git reuses identical file objects, but large binary files that change often can take substantial space. The first version does not yet have an in-app storage meter, expiration policy, or history deletion screen; those should be added before relying on it for long-running projects.
+Version data grows with project changes. Git reuses identical file objects, but large binary files that change often can take substantial space. Imported commits share their existing Git objects; their extra refs use little space. The first version does not yet have an in-app storage meter, expiration policy, or history deletion screen; those should be added before relying on it for long-running projects.
 
 ## Dependencies and cleanup
 
-The app runs the system Git executable. Its Rust dependencies are Tauri 2 and its dialog plugin, plus small support crates for JSON, error reporting, temporary files, and checkpoint IDs. The UI uses Svelte, TypeScript, and Vite. npm packages and Rust crates are developer/build dependencies; the running app does not need Node.js.
+The app runs the system Git executable. Its Rust dependencies are Tauri 2, its dialog plugin, the cross-platform `notify` file watcher, and small support crates for JSON, error reporting, temporary files, and checkpoint IDs. The UI uses Svelte, TypeScript, and Vite. npm packages and Rust crates are developer/build dependencies; the running app does not need Node.js.
 
 From the repository root, the generated development files can be removed with:
 
@@ -38,6 +42,6 @@ They are rebuilt by npm and Cargo when needed. The npm and Cargo package caches 
 ## First version boundaries
 
 - The app uses the Git executable installed on the computer. It does not bundle Git.
-- There is no remote hosting, account, branch browser, merge UI, AI integration, or background file watcher yet.
-- The screen refresh button reads the current folder state again.
-- The first supported workflow is to save local project versions, restore a selected version, and undo that restore.
+- There is no remote hosting, account, branch browser, merge UI, or AI integration.
+- The app watches the selected project and relevant Git refs for changes, then refreshes its status and timeline automatically; the refresh button remains available as a manual fallback.
+- The first supported workflow is to view existing Git history, save local project versions, restore a selected version, and undo that restore.

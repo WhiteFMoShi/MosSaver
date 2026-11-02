@@ -9,6 +9,12 @@ pub(super) struct Metadata {
     #[serde(default = "metadata_version")]
     version: u32,
     #[serde(default)]
+    pub git_history_imported: bool,
+    #[serde(default)]
+    pub git_history_tips: Vec<String>,
+    #[serde(default)]
+    pub last_observed_head: Option<String>,
+    #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
     #[serde(default)]
     pub current_checkpoint: Option<String>,
@@ -20,6 +26,9 @@ impl Default for Metadata {
     fn default() -> Self {
         Self {
             version: metadata_version(),
+            git_history_imported: false,
+            git_history_tips: Vec::new(),
+            last_observed_head: None,
             checkpoints: Vec::new(),
             current_checkpoint: None,
             last_restore_backup: None,
@@ -28,7 +37,7 @@ impl Default for Metadata {
 }
 
 fn metadata_version() -> u32 {
-    1
+    2
 }
 
 pub(super) fn load(path: &Path) -> AppResult<Metadata> {
