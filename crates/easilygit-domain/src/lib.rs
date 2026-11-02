@@ -3,6 +3,6 @@ mod model;
 
 pub use error::{AppError, AppResult};
 pub use model::{
-    ChangeKind, ChangedFile, Checkpoint, CheckpointKind, CheckpointPage, ManagedFile,
-    ProjectOverview, ProjectState,
+    ChangeKind, ChangedFile, Checkpoint, CheckpointDetails, CheckpointKind, CheckpointPage,
+    CheckpointSummary, ManagedFile, ProjectOverview, ProjectState,
 };

@@ -1,6 +1,10 @@
+use std::collections::HashMap;
 use std::path::Path;
 
-use easilygit_domain::{AppError, AppResult, Checkpoint, CheckpointKind};
+use easilygit_domain::{
+    AppError, AppResult, ChangeKind, Checkpoint, CheckpointDetails, CheckpointKind,
+    CheckpointSummary,
+};
 
 use crate::metadata::Metadata;
 
@@ -9,6 +13,160 @@ use super::{commands, snapshot};
 pub(super) const HISTORY_PAGE_SIZE: usize = 50;
 
 const HISTORY_FORMAT: &str = "--format=tformat:%H%x00%cI%x00%s";
+
+/// Fill the parent links for versions written by older MosSaver builds. The
+/// parent is taken from the stored commit graph, then mapped back to another
+/// MosSaver id when that commit belongs to our own history. Native Git
+/// commits remain roots in the MosSaver graph because they are read-only.
+pub(super) fn hydrate_checkpoint_graph(root: &Path, metadata: &mut Metadata) -> AppResult<bool> {
+    if metadata
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.kind != CheckpointKind::Git)
+        .all(|checkpoint| checkpoint.summary.is_some())
+    {
+        return Ok(false);
+    }
+    let environment = commands::app_environment(root)?;
+    let mut commits = HashMap::new();
+    for checkpoint in metadata
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.kind != CheckpointKind::Git)
+    {
+        if let Some(commit) =
+            commands::checkpoint_commit_with_env(root, &checkpoint.id, &environment)?
+        {
+            commits.insert(commit, checkpoint.id.clone());
+        }
+    }
+    let mut changed = false;
+    for checkpoint in metadata
+        .checkpoints
+        .iter_mut()
+        .filter(|checkpoint| checkpoint.kind != CheckpointKind::Git && checkpoint.summary.is_none())
+    {
+        let Some(commit) =
+            commands::checkpoint_commit_with_env(root, &checkpoint.id, &environment)?
+        else {
+            continue;
+        };
+        let parent_commit = first_parent(root, &commit, &environment)?;
+        let parent = parent_commit.as_ref().map(|parent_commit| {
+            commits
+                .get(parent_commit)
+                .cloned()
+                .unwrap_or_else(|| format!("git-{parent_commit}"))
+        });
+        let details =
+            checkpoint_details_for_commit(root, &commit, parent_commit.as_deref(), &environment)?;
+        if checkpoint.parent_id != parent {
+            checkpoint.parent_id = parent;
+        }
+        checkpoint.summary = Some(details.summary);
+        changed = true;
+    }
+    Ok(changed)
+}
+
+pub(super) fn checkpoint_details(
+    root: &Path,
+    checkpoint: &Checkpoint,
+) -> AppResult<CheckpointDetails> {
+    let app_checkpoint = checkpoint.kind != CheckpointKind::Git;
+    let environment = if app_checkpoint {
+        commands::app_environment(root)?
+    } else {
+        Vec::new()
+    };
+    let commit = commands::checkpoint_commit_with_env(root, &checkpoint.id, &environment)?
+        .ok_or(AppError::CheckpointNotFound)?;
+    let parent = match checkpoint.parent_id.as_deref() {
+        Some(parent_id) => commands::checkpoint_commit(root, parent_id)?,
+        None => first_parent(root, &commit, &environment)?,
+    };
+    checkpoint_details_for_commit(root, &commit, parent.as_deref(), &environment)
+}
+
+pub(super) fn checkpoint_details_for_commit(
+    root: &Path,
+    commit: &str,
+    parent: Option<&str>,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> AppResult<CheckpointDetails> {
+    let tree = commands::run_git_with_env(
+        root,
+        &["ls-tree", "-r", "-z", "--name-only", commit],
+        environment,
+    )?;
+    let file_count = tree
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .count();
+    let diff = if let Some(parent) = parent {
+        commands::run_git_with_env(
+            root,
+            &[
+                "diff",
+                "--no-renames",
+                "--name-status",
+                "-z",
+                parent,
+                commit,
+            ],
+            environment,
+        )?
+    } else {
+        commands::run_git_with_env(
+            root,
+            &[
+                "diff-tree",
+                "--root",
+                "--no-commit-id",
+                "--no-renames",
+                "--name-status",
+                "-r",
+                "-z",
+                commit,
+            ],
+            environment,
+        )?
+    };
+    let files = super::status::parse_changes(&diff)?;
+    let summary = CheckpointSummary {
+        file_count,
+        added: files
+            .iter()
+            .filter(|file| file.kind == ChangeKind::Added)
+            .count(),
+        modified: files
+            .iter()
+            .filter(|file| file.kind == ChangeKind::Modified)
+            .count(),
+        deleted: files
+            .iter()
+            .filter(|file| file.kind == ChangeKind::Deleted)
+            .count(),
+    };
+    Ok(CheckpointDetails { summary, files })
+}
+
+fn first_parent(
+    root: &Path,
+    commit: &str,
+    environment: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> AppResult<Option<String>> {
+    let output = commands::run_git_with_env(
+        root,
+        &["rev-list", "--parents", "-n", "1", commit],
+        environment,
+    )?;
+    let parent = String::from_utf8_lossy(&output)
+        .split_whitespace()
+        .nth(1)
+        .map(str::to_owned);
+    Ok(parent)
+}
 
 pub(super) fn update_existing_history(root: &Path, metadata: &mut Metadata) -> AppResult<bool> {
     let mut changed = false;
@@ -135,6 +293,8 @@ fn parse_history_line(line: &[u8]) -> AppResult<Checkpoint> {
         label: nonempty_subject(entry[2]),
         created_at,
         kind: CheckpointKind::Git,
+        parent_id: None,
+        summary: None,
     })
 }
 

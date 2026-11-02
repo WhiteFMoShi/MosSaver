@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use easilygit_app::ProjectPort;
 use easilygit_domain::{
-    AppError, AppResult, ChangedFile, Checkpoint, CheckpointKind, CheckpointPage, ManagedFile,
+    AppError, AppResult, ChangedFile, Checkpoint, CheckpointDetails, CheckpointKind,
+    CheckpointPage, ManagedFile,
 };
 
 use crate::metadata::{self, Metadata};
@@ -110,6 +111,7 @@ impl ProjectPort for SystemGitBackend {
     ) -> AppResult<CheckpointPage> {
         let (metadata_path, mut metadata) = self.load_metadata(root)?;
         let mut changed = history::update_existing_history(root, &mut metadata)?;
+        changed |= history::hydrate_checkpoint_graph(root, &mut metadata)?;
         let required = offset.saturating_add(limit);
         let mut visible = valid_visible_checkpoints(root, &metadata)?;
         while visible.len() < required && metadata.git_history_has_more {
@@ -128,6 +130,16 @@ impl ProjectPort for SystemGitBackend {
             checkpoints: visible.into_iter().skip(offset).take(limit).collect(),
             has_more,
         })
+    }
+
+    fn checkpoint_details(&self, root: &Path, id: &str) -> AppResult<CheckpointDetails> {
+        let (_, metadata) = self.load_metadata(root)?;
+        let checkpoint = metadata
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.id == id)
+            .ok_or(AppError::CheckpointNotFound)?;
+        history::checkpoint_details(root, checkpoint)
     }
 
     fn current_checkpoint_id(&self, root: &Path) -> AppResult<Option<String>> {

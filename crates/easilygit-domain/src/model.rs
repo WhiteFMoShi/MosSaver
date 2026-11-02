@@ -16,6 +16,22 @@ pub struct ProjectState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct CheckpointDetails {
+    pub summary: CheckpointSummary,
+    pub files: Vec<ChangedFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointSummary {
+    pub file_count: usize,
+    pub added: usize,
+    pub modified: usize,
+    pub deleted: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectOverview {
     pub root: String,
     pub name: String,
@@ -38,6 +54,12 @@ pub struct Checkpoint {
     pub label: String,
     pub created_at: String,
     pub kind: CheckpointKind,
+    /// The MosSaver version or read-only Git commit this version was created
+    /// from. Native Git history entries leave this empty.
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub summary: Option<CheckpointSummary>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

@@ -130,6 +130,16 @@ async fn load_more_checkpoints(
 }
 
 #[tauri::command]
+async fn checkpoint_details(
+    path: String,
+    checkpoint_id: String,
+    service: State<'_, ProjectService<SystemGitBackend>>,
+) -> Result<easilygit_domain::CheckpointDetails, CommandError> {
+    let service = service.inner().clone();
+    run_blocking(move || service.checkpoint_details(&PathBuf::from(path), &checkpoint_id)).await
+}
+
+#[tauri::command]
 async fn list_managed_files(
     path: String,
     service: State<'_, ProjectService<SystemGitBackend>>,
@@ -455,6 +465,7 @@ pub fn run() {
             restore_checkpoint,
             undo_restore,
             load_more_checkpoints,
+            checkpoint_details,
             list_managed_files,
             set_file_managed,
             disable_protection,

@@ -54,7 +54,7 @@ fn output_text(root: &Path, args: &[&str], envs: &[(OsString, OsString)]) -> App
         .map_err(|_| AppError::Git("Git returned invalid text output".into()))
 }
 
-fn parse_changes(diff: &[u8]) -> AppResult<Vec<ChangedFile>> {
+pub(super) fn parse_changes(diff: &[u8]) -> AppResult<Vec<ChangedFile>> {
     let mut fields = diff.split(|byte| *byte == 0);
     let mut changes = Vec::new();
 

@@ -31,8 +31,21 @@ pub(super) fn write_checkpoint(
     let mut envs = commands::app_environment(root)?;
     envs.push(commands::index_env(&index_path));
 
-    if let Some(head) = head_commit(root) {
-        commands::run_git_with_env(root, &["read-tree", &head], &envs)?;
+    let previous_checkpoint_id = metadata.current_checkpoint.clone();
+    let mut parent_id = previous_checkpoint_id.clone();
+    let mut parent_commit = match previous_checkpoint_id.as_deref() {
+        Some(id) if !id.starts_with("git-") => {
+            commands::checkpoint_commit_with_env(root, id, &envs)?
+        }
+        _ => None,
+    };
+    if parent_commit.is_none() {
+        parent_commit = head_commit(root);
+        parent_id = parent_commit.as_ref().map(|commit| format!("git-{commit}"));
+    }
+
+    if let Some(parent) = &parent_commit {
+        commands::run_git_with_env(root, &["read-tree", parent], &envs)?;
     } else {
         commands::run_git_with_env(root, &["read-tree", "--empty"], &envs)?;
     }
@@ -41,9 +54,9 @@ pub(super) fn write_checkpoint(
     let tree = output_text(root, &["write-tree"], &envs)?;
     let id = Uuid::new_v4().simple().to_string();
     let mut commit_args = vec!["commit-tree".to_owned(), tree];
-    if let Some(head) = head_commit(root) {
+    if let Some(parent) = &parent_commit {
         commit_args.push("-p".to_owned());
-        commit_args.push(head);
+        commit_args.push(parent.clone());
     }
     let effective_label = if label.trim().is_empty() {
         if automatic {
@@ -64,6 +77,13 @@ pub(super) fn write_checkpoint(
     let reference = commands::checkpoint_ref(&id);
     commands::run_git_with_env(root, &["update-ref", &reference, &commit], &envs)?;
     let created_at = output_text(root, &["show", "-s", "--format=%cI", &commit], &envs)?;
+    let summary = super::history::checkpoint_details_for_commit(
+        root,
+        &commit,
+        parent_commit.as_deref(),
+        &envs,
+    )?
+    .summary;
 
     let checkpoint = Checkpoint {
         id,
@@ -74,6 +94,8 @@ pub(super) fn write_checkpoint(
         } else {
             CheckpointKind::User
         },
+        parent_id,
+        summary: Some(summary),
     };
     metadata.checkpoints.push(checkpoint.clone());
     metadata.current_checkpoint = Some(checkpoint.id.clone());

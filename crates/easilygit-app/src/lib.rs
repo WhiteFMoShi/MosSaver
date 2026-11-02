@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use easilygit_domain::{
-    AppError, AppResult, ChangedFile, Checkpoint, CheckpointPage, ManagedFile, ProjectOverview,
-    ProjectState,
+    AppError, AppResult, ChangedFile, Checkpoint, CheckpointDetails, CheckpointPage, ManagedFile,
+    ProjectOverview, ProjectState,
 };
 
 const CHECKPOINT_PAGE_SIZE: usize = 50;
@@ -18,6 +18,7 @@ pub trait ProjectPort: Send + Sync + 'static {
         offset: usize,
         limit: usize,
     ) -> AppResult<CheckpointPage>;
+    fn checkpoint_details(&self, root: &Path, id: &str) -> AppResult<CheckpointDetails>;
     fn current_checkpoint_id(&self, root: &Path) -> AppResult<Option<String>>;
     fn has_user_checkpoint(&self, root: &Path) -> AppResult<bool>;
     fn create_checkpoint(&self, root: &Path, label: &str, automatic: bool)
@@ -118,6 +119,11 @@ impl<P: ProjectPort> ProjectService<P> {
         let root = self.protected_root(path)?;
         self.port
             .checkpoints_page(&root, offset, CHECKPOINT_PAGE_SIZE)
+    }
+
+    pub fn checkpoint_details(&self, path: &Path, id: &str) -> AppResult<CheckpointDetails> {
+        let root = self.protected_root(path)?;
+        self.port.checkpoint_details(&root, id)
     }
 
     pub fn managed_files(&self, path: &Path) -> AppResult<Vec<ManagedFile>> {

@@ -116,6 +116,22 @@ fn save_restore_and_undo_follow_the_saved_version() {
         saved.current_checkpoint_id.as_deref(),
         Some(saved_id.as_str())
     );
+    let saved_checkpoint = saved
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == saved_id)
+        .unwrap();
+    assert_eq!(
+        saved_checkpoint.parent_id.as_deref(),
+        Some(initial_id.as_str())
+    );
+    assert_eq!(saved_checkpoint.summary.as_ref().unwrap().file_count, 3);
+    assert_eq!(saved_checkpoint.summary.as_ref().unwrap().added, 1);
+    assert_eq!(saved_checkpoint.summary.as_ref().unwrap().modified, 1);
+    assert_eq!(saved_checkpoint.summary.as_ref().unwrap().deleted, 1);
+    let details = service.checkpoint_details(root, &saved_id).unwrap();
+    assert_eq!(details.summary, saved_checkpoint.summary.clone().unwrap());
+    assert_eq!(details.files.len(), 3);
 
     fs::write(root.join("notes.txt"), "later work\n").unwrap();
     fs::write(root.join("later.txt"), "another file\n").unwrap();
@@ -172,6 +188,134 @@ fn saving_a_version_does_not_change_the_users_git_index() {
 
     assert_eq!(fs::read(&index_path).unwrap(), index_before);
     assert!(service.refresh(root).unwrap().current_changes.is_empty());
+}
+
+#[test]
+fn restoring_a_parent_then_saving_creates_a_sibling_branch_from_that_parent() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "one\n").unwrap();
+    let service = ProjectService::new(SystemGitBackend);
+    let initial = service.enable_protection(root).unwrap();
+    let initial_id = initial.checkpoints[0].id.clone();
+
+    fs::write(root.join("notes.txt"), "first branch\n").unwrap();
+    let first = service.save_version(root, "01:19 version").unwrap();
+    let first_id = first
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.label == "01:19 version")
+        .unwrap()
+        .id
+        .clone();
+
+    fs::write(root.join("notes.txt"), "later on first branch\n").unwrap();
+    let second = service.save_version(root, "02:45 version").unwrap();
+    let second_id = second
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.label == "02:45 version")
+        .unwrap()
+        .id
+        .clone();
+
+    service.restore(root, &first_id).unwrap();
+    fs::write(root.join("notes.txt"), "new work from 01:19\n").unwrap();
+    let branch = service.save_version(root, "03:57 version").unwrap();
+    let branch_checkpoint = branch
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.label == "03:57 version")
+        .unwrap();
+    let second_checkpoint = branch
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.id == second_id)
+        .unwrap();
+
+    assert_eq!(
+        branch.current_checkpoint_id.as_deref(),
+        Some(branch_checkpoint.id.as_str())
+    );
+    assert_eq!(
+        branch_checkpoint.parent_id.as_deref(),
+        Some(first_id.as_str())
+    );
+    assert_eq!(
+        second_checkpoint.parent_id.as_deref(),
+        Some(first_id.as_str()),
+    );
+    assert_eq!(branch_checkpoint.summary.as_ref().unwrap().modified, 1);
+    let details = service
+        .checkpoint_details(root, &branch_checkpoint.id)
+        .unwrap();
+    assert_eq!(details.files.len(), 1);
+    assert_eq!(details.files[0].path, "notes.txt");
+    assert_eq!(details.files[0].kind, ChangeKind::Modified);
+
+    let branch_ref = format!("refs/easilygit/checkpoints/{}", branch_checkpoint.id);
+    let branch_commit = String::from_utf8(git_store(root, &["rev-parse", &branch_ref]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let actual_parent = String::from_utf8(git_store(
+        root,
+        &["rev-list", "--parents", "-n", "1", &branch_commit],
+    ))
+    .unwrap()
+    .split_whitespace()
+    .nth(1)
+    .unwrap()
+    .to_owned();
+    let first_ref = format!("refs/easilygit/checkpoints/{first_id}");
+    let first_commit = String::from_utf8(git_store(root, &["rev-parse", &first_ref]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert_eq!(actual_parent, first_commit);
+    assert_ne!(
+        branch_checkpoint.parent_id.as_deref(),
+        Some(initial_id.as_str())
+    );
+}
+
+#[test]
+fn older_mossaver_versions_are_hydrated_with_their_real_parent_links() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "one\n").unwrap();
+    let service = ProjectService::new(SystemGitBackend);
+    service.enable_protection(root).unwrap();
+    fs::write(root.join("notes.txt"), "two\n").unwrap();
+    service.save_version(root, "second line").unwrap();
+
+    let metadata_path = root.join(".git/easilygit/metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    for checkpoint in metadata["checkpoints"].as_array_mut().unwrap() {
+        checkpoint.as_object_mut().unwrap().remove("parentId");
+        checkpoint.as_object_mut().unwrap().remove("summary");
+    }
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    let refreshed = service.refresh(root).unwrap();
+    let initial = refreshed
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.label == "开始使用 MosSaver")
+        .unwrap();
+    let second = refreshed
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.label == "second line")
+        .unwrap();
+    assert_eq!(second.parent_id.as_deref(), Some(initial.id.as_str()));
+    assert_eq!(initial.summary.as_ref().unwrap().file_count, 1);
+    assert_eq!(second.summary.as_ref().unwrap().modified, 1);
 }
 
 #[test]

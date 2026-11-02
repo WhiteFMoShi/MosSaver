@@ -19,6 +19,28 @@
     label: string;
     createdAt: string;
     kind: "user" | "git" | "automatic";
+    parentId: string | null;
+    summary: CheckpointSummary | null;
+  }
+
+  interface CheckpointSummary {
+    fileCount: number;
+    added: number;
+    modified: number;
+    deleted: number;
+  }
+
+  interface CheckpointDetails {
+    summary: CheckpointSummary;
+    files: ChangedFile[];
+  }
+
+  interface TimelineEntry {
+    checkpoint: Checkpoint;
+    lane: number;
+    parent: Checkpoint | null;
+    hasSibling: boolean;
+    isActiveLineage: boolean;
   }
 
   interface CheckpointPage {
@@ -60,7 +82,13 @@
   let refreshingFolders = $state(false);
   let errorMessage = $state("");
   let selectedCheckpoint = $state<Checkpoint | null>(null);
-  let dialogMode = $state<"restore" | "undo" | null>(null);
+  let dialogMode = $state<"save" | "restore" | "undo" | null>(null);
+  let saveLabel = $state("");
+  let checkpointDetails = $state<Record<string, CheckpointDetails>>({});
+  let expandedCheckpointId = $state<string | null>(null);
+  let loadingCheckpointId = $state<string | null>(null);
+  let changesPaneWidth = $state(340);
+  let paneResizeCleanup: (() => void) | undefined;
   let managedFilesOpen = $state(false);
   let managedFiles = $state<ManagedFile[]>([]);
   let stopProtectionOpen = $state(false);
@@ -78,6 +106,8 @@
     let unlisten: (() => void) | undefined;
     const storedTheme = localStorage.getItem("mossaver-theme");
     applyTheme(storedTheme === "dark" ? "dark" : "light", false);
+    const storedPaneWidth = Number(localStorage.getItem("mossaver-changes-pane-width"));
+    if (Number.isFinite(storedPaneWidth)) changesPaneWidth = Math.min(520, Math.max(280, storedPaneWidth));
 
     listen<string>("project-files-changed", (event) => {
       scheduleProjectRefresh(event.payload);
@@ -113,6 +143,7 @@
       overviewTimers.clear();
       unlisten?.();
       void invoke("stop_project_watch").catch(() => {});
+      paneResizeCleanup?.();
     };
   });
 
@@ -136,6 +167,73 @@
   const showCurrentFilesNode = $derived(
     Boolean(project && (project.currentChanges.length > 0 || !currentCheckpointVisible)),
   );
+  const timelineEntries = $derived.by((): TimelineEntry[] => {
+    if (!project) return [];
+    const checkpoints = project.checkpoints;
+    const byId = new Map(checkpoints.map((checkpoint) => [checkpoint.id, checkpoint]));
+    const children = new Map<string, Checkpoint[]>();
+    for (const checkpoint of checkpoints) {
+      if (checkpoint.parentId && byId.has(checkpoint.parentId)) {
+        const siblings = children.get(checkpoint.parentId) ?? [];
+        siblings.push(checkpoint);
+        children.set(checkpoint.parentId, siblings);
+      }
+    }
+    // Follow the selected version's ancestry on the main lane. Other children
+    // of a fork get their own lanes, so the visible graph follows the branch
+    // the user is currently working on instead of guessing from timestamps.
+    const sortOldest = (left: Checkpoint, right: Checkpoint) =>
+      left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
+    for (const siblings of children.values()) siblings.sort(sortOldest);
+    const activePath = new Set<string>();
+    let active = byId.get(project.currentCheckpointId ?? "");
+    while (active && !activePath.has(active.id)) {
+      activePath.add(active.id);
+      active = active.parentId ? byId.get(active.parentId) : undefined;
+    }
+    const laneById = new Map<string, number>();
+    const siblingById = new Set<string>();
+    const orderedIds: string[] = [];
+    let nextLane = 1;
+    const visited = new Set<string>();
+    const visit = (checkpoint: Checkpoint, lane: number) => {
+      if (visited.has(checkpoint.id)) return;
+      visited.add(checkpoint.id);
+      orderedIds.push(checkpoint.id);
+      laneById.set(checkpoint.id, lane);
+      const childList = children.get(checkpoint.id) ?? [];
+      if (childList.length > 1) {
+        for (const child of childList) siblingById.add(child.id);
+      }
+      const mainChild = childList.find((child) => activePath.has(child.id)) ?? childList[0];
+      const orderedChildren = mainChild
+        ? [mainChild, ...childList.filter((child) => child !== mainChild)]
+        : childList;
+      for (const child of orderedChildren) {
+        const isMainChild = child === mainChild;
+        const childLane = isMainChild ? lane : nextLane++;
+        visit(child, childLane);
+      }
+    };
+    // A checkpoint whose parent is not loaded is a root for this page. It is
+    // still rendered, but cannot distort lanes belonging to known parents.
+    const oldestFirst = [...checkpoints].sort(
+      (left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
+    );
+    for (const checkpoint of oldestFirst) {
+      if (!checkpoint.parentId || !byId.has(checkpoint.parentId)) visit(checkpoint, 0);
+    }
+    for (const checkpoint of oldestFirst) visit(checkpoint, 0);
+    return orderedIds
+      .map((id) => byId.get(id)!)
+      .map((checkpoint) => ({
+        checkpoint,
+        lane: laneById.get(checkpoint.id) ?? 0,
+        parent: checkpoint.parentId ? byId.get(checkpoint.parentId) ?? null : null,
+        hasSibling: siblingById.has(checkpoint.id),
+        isActiveLineage: activePath.has(checkpoint.id),
+      }));
+  });
 
   function applyTheme(nextTheme: Theme, persist = true) {
     theme = nextTheme;
@@ -279,16 +377,48 @@
     });
   }
 
+  function openSaveDialog() {
+    if (!project || project.currentChanges.length === 0 || loading) return;
+    saveLabel = "";
+    errorMessage = "";
+    dialogMode = "save";
+  }
+
   async function saveVersion() {
     if (!project) return;
+    const label = saveLabel.trim() || "未命名版本";
     await perform(async () => {
       const saved = await invoke<ProjectState>("save_version", {
         path: project!.root,
-        label: "手动保存的版本",
+        label,
       });
       await adoptProjectState(saved, loadedCheckpointCount);
       updateFolderOverviewFromProject(saved);
+      dialogMode = null;
+      saveLabel = "";
     });
+  }
+
+  async function toggleCheckpointDetails(checkpoint: Checkpoint) {
+    if (expandedCheckpointId === checkpoint.id) {
+      expandedCheckpointId = null;
+      return;
+    }
+    expandedCheckpointId = checkpoint.id;
+    if (checkpointDetails[checkpoint.id]) return;
+    loadingCheckpointId = checkpoint.id;
+    try {
+      const details = await invoke<CheckpointDetails>("checkpoint_details", {
+        path: project!.root,
+        checkpointId: checkpoint.id,
+      });
+      checkpointDetails = { ...checkpointDetails, [checkpoint.id]: details };
+    } catch (error) {
+      errorMessage = friendlyError(error);
+      expandedCheckpointId = null;
+    } finally {
+      loadingCheckpointId = null;
+    }
   }
 
   async function restoreVersion() {
@@ -495,6 +625,49 @@
     return checkpoint.label === "开始使用 EasilyGit" ? "开始使用 MosSaver" : checkpoint.label;
   }
 
+  function checkpointReference(checkpoint: Checkpoint): string {
+    const date = new Date(checkpoint.createdAt);
+    const shortTime = Number.isNaN(date.getTime())
+      ? checkpoint.createdAt
+      : new Intl.DateTimeFormat("zh-CN", {
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        }).format(date);
+    return `${shortTime} · ${checkpointLabel(checkpoint)}`;
+  }
+
+  function setPaneWidth(width: number) {
+    changesPaneWidth = Math.min(520, Math.max(280, width));
+  }
+
+  function adjustPaneWidth(delta: number) {
+    setPaneWidth(changesPaneWidth + delta);
+    localStorage.setItem("mossaver-changes-pane-width", String(changesPaneWidth));
+  }
+
+  function startPaneResize(event: PointerEvent) {
+    if (window.innerWidth <= 860) return;
+    paneResizeCleanup?.();
+    const startX = event.clientX;
+    const startWidth = changesPaneWidth;
+    const move = (moveEvent: PointerEvent) => setPaneWidth(startWidth + moveEvent.clientX - startX);
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      localStorage.setItem("mossaver-changes-pane-width", String(changesPaneWidth));
+      paneResizeCleanup = undefined;
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop, { once: true });
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    paneResizeCleanup = stop;
+  }
+
   function fileName(path: string): string {
     return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
   }
@@ -615,30 +788,15 @@
       {/if}
     </section>
   {:else}
-    <section class="project-view" in:fly={{ x: 14, duration: 230, easing: cubicOut }} out:fly={{ x: 10, duration: 150, easing: cubicOut }}>
-      <div class:project-heading-compact={project.initialized} class="project-heading">
-        {#if !project.initialized}
+    <section class:project-main={project.initialized} class="project-view" in:fly={{ x: 14, duration: 230, easing: cubicOut }} out:fly={{ x: 10, duration: 150, easing: cubicOut }}>
+      {#if !project.initialized}
+        <div class="project-heading">
           <div class="heading-copy">
             <h1>{project.name}</h1>
             <p class="project-path" title={project.root}>{project.root}</p>
           </div>
-        {/if}
-        {#if project.initialized}
-          <div class="project-heading-actions">
-            {#if project.canUndoRestore}
-              <button class="button button-subtle" onclick={requestUndoRestore} disabled={loading}>撤销恢复</button>
-            {/if}
-            <button class="button button-subtle refresh-button" onclick={refreshProject} disabled={loading} aria-label="刷新文件夹状态">
-              <svg class:spinning={loading} viewBox="0 0 20 20" aria-hidden="true"><path d="M16.3 8A6.5 6.5 0 0 0 4.9 5.7L3.5 7.1M3.7 4.2v3.2h3.2M3.7 12A6.5 6.5 0 0 0 15.1 14.3l1.4-1.4m-.2 3v-3.2h-3.2" /></svg>
-              刷新
-            </button>
-            <button class="button button-primary" onclick={saveVersion} disabled={loading || project.currentChanges.length === 0}>
-              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3.5v9m-3.5-3.5L10 12.5l3.5-3.5M4.5 15.5v1h11v-1" /></svg>
-              保存版本
-            </button>
-          </div>
-        {/if}
-      </div>
+        </div>
+      {/if}
 
       {#if !project.initialized}
         <section class="setup-card">
@@ -661,17 +819,29 @@
           </div>
         </section>
       {:else}
-        <div class="content-grid">
+        <div class="content-grid" style={`--changes-pane-width: ${changesPaneWidth}px`}>
           <section class="panel changes-panel">
             <div class="panel-heading">
-              <div><h2>文件变化 <span class="panel-context">{project.name}</span></h2><p>项目中的修改会显示在这里</p></div>
+              <div class="panel-heading-copy">
+                <h2><span>文件变化</span><span class="panel-context" title={project.name}>{project.name}</span></h2>
+              </div>
               <div class="panel-heading-actions">
-                <button class="text-button" onclick={openManagedFiles} disabled={loading}>管理文件</button>
+                <button class="icon-action" data-tooltip="管理文件" aria-label="管理文件" onclick={openManagedFiles} disabled={loading}>
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.8 5.5h5l1.5 1.7h7.9v7.5a1.5 1.5 0 0 1-1.5 1.5H4.3a1.5 1.5 0 0 1-1.5-1.5z"/><path d="M2.8 8.2h14.4"/></svg>
+                </button>
+                {#if project.canUndoRestore}
+                  <button class="icon-action" data-tooltip="撤销上次恢复" aria-label="撤销上次恢复" onclick={requestUndoRestore} disabled={loading}>
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 7.5a6.5 6.5 0 1 1-.1 5M4 3.8v3.8h3.8"/><path d="M10 6.5v3.8l2.3 1.4"/></svg>
+                  </button>
+                {/if}
+                <button class="icon-action icon-action-primary" data-tooltip="保存版本" aria-label="保存版本" onclick={openSaveDialog} disabled={loading || project.currentChanges.length === 0}>
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3.5 3.5h10l3 3v10h-13z"/><path d="M6.5 3.5v5h7v-5M6.5 16.5v-5h7v5"/></svg>
+                </button>
               </div>
             </div>
             {#if project.currentChanges.length === 0}
               <div class="empty-panel">
-                <span class="empty-check">✓</span><strong>暂时没有新的变化</strong><span>有新修改时，会显示在这里。</span>
+                <span class="empty-check">✓</span><strong>暂时没有新的变化</strong>
               </div>
             {:else}
               <ul class="file-list">
@@ -686,6 +856,17 @@
               </ul>
             {/if}
           </section>
+
+          <button
+            class="pane-divider"
+            aria-label="调整文件变化区宽度"
+            tabindex="0"
+            onpointerdown={startPaneResize}
+            onkeydown={(event) => {
+              if (event.key === "ArrowLeft") { event.preventDefault(); adjustPaneWidth(-16); }
+              if (event.key === "ArrowRight") { event.preventDefault(); adjustPaneWidth(16); }
+            }}
+          ></button>
 
           <section class="panel history-panel">
             <div class="panel-heading">
@@ -712,16 +893,49 @@
                     </div>
                   </li>
                 {/if}
-                {#each project.checkpoints as checkpoint (checkpoint.id)}
+                {#each timelineEntries as entry (entry.checkpoint.id)}
+                  {@const checkpoint = entry.checkpoint}
                   {@const isCurrentCheckpoint = checkpoint.id === project.currentCheckpointId}
-                  <li class:current-checkpoint={isCurrentCheckpoint} class="timeline-item">
-                    <span class="timeline-marker">{#if isCurrentCheckpoint}<span></span>{/if}</span>
+                  <li class:current-checkpoint={isCurrentCheckpoint} class:timeline-branch={entry.hasSibling} class:active-lineage={entry.isActiveLineage} class="timeline-item">
+                    <span class="timeline-graph" style={`--branch-offset: ${entry.lane * 20}px`} aria-hidden="true">
+                      <span class="timeline-marker">{#if isCurrentCheckpoint}<span></span>{/if}</span>
+                    </span>
                     <div class="timeline-content">
                       <div class="timeline-title-row">
                         <h3>{checkpointLabel(checkpoint)}</h3>
                         {#if isCurrentCheckpoint}<span class="latest-badge">{project.currentChanges.length > 0 ? "保存基准" : "当前"}</span>{/if}
                       </div>
                       <p class="timeline-time">{formatTime(checkpoint.createdAt)}</p>
+                      {#if checkpoint.parentId && (entry.hasSibling || isCurrentCheckpoint)}
+                        <span class="timeline-fork">
+                          {entry.hasSibling ? "分支自" : "基于"}
+                          {entry.parent ? checkpointReference(entry.parent) : checkpoint.parentId.startsWith("git-") ? `Git 历史 ${checkpoint.parentId.slice(4, 10)}` : "较早版本"}
+                        </span>
+                      {/if}
+                      {#if checkpoint.summary}
+                        <div class="checkpoint-summary">
+                          <span>{checkpoint.summary.fileCount} 个文件</span>
+                          {#if checkpoint.summary.added > 0}<span class="summary-added">+{checkpoint.summary.added}</span>{/if}
+                          {#if checkpoint.summary.modified > 0}<span class="summary-modified">·{checkpoint.summary.modified}</span>{/if}
+                          {#if checkpoint.summary.deleted > 0}<span class="summary-deleted">−{checkpoint.summary.deleted}</span>{/if}
+                          <button class="details-link" onclick={() => toggleCheckpointDetails(checkpoint)} disabled={loadingCheckpointId === checkpoint.id}>
+                            {loadingCheckpointId === checkpoint.id ? "读取中…" : expandedCheckpointId === checkpoint.id ? "收起变更" : "查看变更"}
+                          </button>
+                        </div>
+                      {:else}
+                        <button class="details-link details-link-standalone" onclick={() => toggleCheckpointDetails(checkpoint)} disabled={loadingCheckpointId === checkpoint.id}>
+                          {loadingCheckpointId === checkpoint.id ? "读取中…" : expandedCheckpointId === checkpoint.id ? "收起详情" : "查看文件详情"}
+                        </button>
+                      {/if}
+                      {#if expandedCheckpointId === checkpoint.id && checkpointDetails[checkpoint.id]}
+                        <div class="checkpoint-details">
+                          {#each checkpointDetails[checkpoint.id].files as file (file.path)}
+                            <span class="checkpoint-file"><b class="summary-{file.kind}">{file.kind === "added" ? "+" : file.kind === "deleted" ? "−" : "·"}</b>{file.path}</span>
+                          {:else}
+                            <span class="checkpoint-no-changes">与父版本相比没有文件变化</span>
+                          {/each}
+                        </div>
+                      {/if}
                       {#if checkpoint.kind === "git"}<span class="readonly-note">Git 提交 · 仅查看</span>{/if}
                       {#if checkpoint.kind === "automatic"}<span class="automatic-note">自动安全保存</span>{/if}
                       {#if checkpoint.kind !== "git"}
@@ -763,6 +977,10 @@
       {#if loading || refreshingFolders}
         <span class="statusbar-state is-busy"><span class="statusbar-spinner"></span>{loading ? "正在处理…" : "正在同步状态…"}</span>
       {:else if project?.initialized}
+        <button class="statusbar-refresh" onclick={refreshProject} disabled={loading} title="刷新当前文件夹状态">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.3 8A6.5 6.5 0 0 0 4.9 5.7L3.5 7.1M3.7 4.2v3.2h3.2M3.7 12A6.5 6.5 0 0 0 15.1 14.3l1.4-1.4m-.2 3v-3.2h-3.2" /></svg>
+          刷新
+        </button>
         <span class="statusbar-state" class:has-changes={project.currentChanges.length > 0}>
           <span class="statusbar-dot"></span>
           {project.currentChanges.length > 0 ? `${project.currentChanges.length} 项变化，尚未保存` : "已保存"}
@@ -781,6 +999,22 @@
     </div>
   </footer>
 </main>
+
+{#if dialogMode === "save"}
+  <div class="modal-backdrop" role="presentation">
+    <dialog open class="confirm-modal save-modal" aria-modal="true" aria-labelledby="save-title" aria-describedby="save-description">
+      <div class="modal-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h11l3 3v12H5zM8 4.5v5h8v-5M8 19.5v-6h8v6" /></svg></div>
+      <h2 id="save-title">保存当前版本</h2>
+      <p id="save-description">给这次修改写一句说明，之后可以更容易地找到和恢复它。</p>
+      <input class="save-label-input" bind:value={saveLabel} maxlength="120" placeholder="例如：完成首页布局" autofocus onkeydown={(event) => event.key === "Enter" && saveVersion()} />
+      {#if errorMessage}<p class="modal-error" role="alert">{errorMessage}</p>{/if}
+      <div class="modal-actions">
+        <button class="button button-subtle" onclick={() => dialogMode = null} disabled={loading}>取消</button>
+        <button class="button button-primary" onclick={saveVersion} disabled={loading}>{loading ? "正在保存…" : "保存版本"}</button>
+      </div>
+    </dialog>
+  </div>
+{/if}
 
 {#if (dialogMode === "restore" && selectedCheckpoint !== null) || dialogMode === "undo"}
   <div class="modal-backdrop" role="presentation">
