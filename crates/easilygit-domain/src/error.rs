@@ -14,6 +14,8 @@ pub enum AppError {
     NotInitialized,
     #[error("The requested checkpoint could not be found.")]
     CheckpointNotFound,
+    #[error("Git history entries can be viewed but not restored by EasilyGit.")]
+    CheckpointReadOnly,
     #[error("There is no restore operation to undo.")]
     NothingToUndo,
     #[error("A repository path or file name could not be represented safely.")]
@@ -38,6 +40,7 @@ impl AppError {
             Self::NotARepository => "NOT_A_REPOSITORY",
             Self::NotInitialized => "NOT_INITIALIZED",
             Self::CheckpointNotFound => "CHECKPOINT_NOT_FOUND",
+            Self::CheckpointReadOnly => "CHECKPOINT_READ_ONLY",
             Self::NothingToUndo => "NOTHING_TO_UNDO",
             Self::InvalidPath => "INVALID_PATH",
             Self::PermissionDenied => "PERMISSION_DENIED",

@@ -15,6 +15,16 @@ pub(super) struct Metadata {
     #[serde(default)]
     pub last_observed_head: Option<String>,
     #[serde(default)]
+    pub git_history_scan_offset: usize,
+    #[serde(default)]
+    pub git_history_has_more: bool,
+    #[serde(default)]
+    pub git_history_order: Vec<String>,
+    #[serde(default)]
+    pub git_history_refs_cleaned: bool,
+    #[serde(default)]
+    pub excluded_paths: Vec<String>,
+    #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
     #[serde(default)]
     pub current_checkpoint: Option<String>,
@@ -29,6 +39,11 @@ impl Default for Metadata {
             git_history_imported: false,
             git_history_tips: Vec::new(),
             last_observed_head: None,
+            git_history_scan_offset: 0,
+            git_history_has_more: false,
+            git_history_order: Vec::new(),
+            git_history_refs_cleaned: false,
+            excluded_paths: Vec::new(),
             checkpoints: Vec::new(),
             current_checkpoint: None,
             last_restore_backup: None,

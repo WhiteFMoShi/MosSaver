@@ -3,33 +3,46 @@ use std::{ffi::OsString, path::Path};
 use easilygit_domain::{AppError, AppResult, ChangeKind, ChangedFile};
 use tempfile::tempdir;
 
-use super::commands;
+use super::{commands, files};
 
-pub(super) fn current_changes(root: &Path, base: Option<&str>) -> AppResult<Vec<ChangedFile>> {
+pub(super) fn current_changes(
+    root: &Path,
+    base: Option<&str>,
+    excluded_paths: &[String],
+) -> AppResult<Vec<ChangedFile>> {
     let temporary = tempdir().map_err(|error| AppError::Internal(error.to_string()))?;
-    let index_path = temporary.path().join("status-index");
-    let index_env = commands::index_env(&index_path);
-    let envs = [index_env];
+    let base_index_path = temporary.path().join("base-index");
+    let current_index_path = temporary.path().join("current-index");
+    let app_env = commands::app_environment(root)?;
+    let mut base_env = app_env.clone();
+    base_env.push(commands::index_env(&base_index_path));
+    let mut current_env = app_env;
+    current_env.push(commands::index_env(&current_index_path));
 
     if let Some(base) = base {
-        commands::run_git_with_env(root, &["read-tree", base], &envs)?;
+        commands::run_git_with_env(root, &["read-tree", base], &base_env)?;
+        commands::run_git_with_env(root, &["read-tree", base], &current_env)?;
     } else {
-        commands::run_git_with_env(root, &["read-tree", "--empty"], &envs)?;
+        commands::run_git_with_env(root, &["read-tree", "--empty"], &base_env)?;
+        commands::run_git_with_env(root, &["read-tree", "--empty"], &current_env)?;
     }
-    commands::run_git_with_env(root, &["add", "--all", "--", "."], &envs)?;
-    let tree = output_text(root, &["write-tree"], &envs)?;
-    let empty_tree;
-    let base = match base {
-        Some(base) => base,
-        None => {
-            empty_tree = output_text(root, &["mktree"], &[])?;
-            &empty_tree
-        }
-    };
+    commands::run_git_with_env(root, &["add", "--all", "--", "."], &current_env)?;
+    files::apply_exclusions(root, &base_env, excluded_paths)?;
+    files::apply_exclusions(root, &current_env, excluded_paths)?;
+    let base_tree = output_text(root, &["write-tree"], &base_env)?;
+    let current_tree = output_text(root, &["write-tree"], &current_env)?;
 
-    let diff = commands::run_git(
+    let diff = commands::run_git_with_env(
         root,
-        &["diff", "--no-renames", "--name-status", "-z", base, &tree],
+        &[
+            "diff",
+            "--no-renames",
+            "--name-status",
+            "-z",
+            &base_tree,
+            &current_tree,
+        ],
+        &base_env,
     )?;
     parse_changes(&diff)
 }

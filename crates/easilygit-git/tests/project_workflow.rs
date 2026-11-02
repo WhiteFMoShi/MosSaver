@@ -19,6 +19,23 @@ fn git(root: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
+fn git_store(root: &Path, args: &[&str]) -> Vec<u8> {
+    let store = root.join(".git/easilygit/store.git");
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(store)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("git must be installed for integration tests");
+    assert!(
+        output.status.success(),
+        "git --git-dir <EasilyGit store> {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
 #[test]
 fn save_restore_and_undo_follow_the_saved_version() {
     let directory = tempdir().unwrap();
@@ -36,7 +53,13 @@ fn save_restore_and_undo_follow_the_saved_version() {
     assert!(initial.initialized);
     assert_eq!(initial.checkpoints.len(), 1);
     assert!(initial.current_changes.is_empty());
-    let initial_id = initial.checkpoints[0].id.clone();
+    let initial_id = initial
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.kind == easilygit_domain::CheckpointKind::User)
+        .unwrap()
+        .id
+        .clone();
 
     fs::write(root.join("notes.txt"), "edited after initial\n").unwrap();
     fs::remove_file(root.join("to-remove.txt")).unwrap();
@@ -145,6 +168,79 @@ fn an_existing_git_repository_requires_an_explicit_start() {
 }
 
 #[test]
+fn repository_info_excludes_are_respected_by_easilygit() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    git(root, &["init", "--quiet"]);
+    fs::write(root.join(".git/info/exclude"), "local-ignored.txt\n").unwrap();
+    fs::write(root.join("local-ignored.txt"), "ignored local file\n").unwrap();
+    fs::write(root.join("notes.txt"), "tracked by EasilyGit\n").unwrap();
+
+    let service = ProjectService::new(SystemGitBackend);
+    let enabled = service.enable_protection(root).unwrap();
+    assert!(enabled.current_changes.is_empty());
+    let initial = enabled
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.kind == easilygit_domain::CheckpointKind::User)
+        .unwrap()
+        .id
+        .clone();
+    fs::write(root.join("notes.txt"), "later content\n").unwrap();
+    service.restore(root, &initial).unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("local-ignored.txt")).unwrap(),
+        "ignored local file\n"
+    );
+}
+
+#[test]
+fn sha256_git_repositories_can_be_protected() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "first content\n").unwrap();
+    let initialized = Command::new("git")
+        .args(["init", "--quiet", "--object-format=sha256"])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    if !initialized.status.success() {
+        eprintln!(
+            "Skipping SHA-256 repository test: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        return;
+    }
+
+    let service = ProjectService::new(SystemGitBackend);
+    let initial = service.enable_protection(root).unwrap();
+    let initial_id = initial
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.kind == easilygit_domain::CheckpointKind::User)
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        String::from_utf8(git_store(root, &["rev-parse", "--show-object-format"]))
+            .unwrap()
+            .trim(),
+        "sha256"
+    );
+    fs::write(root.join("notes.txt"), "second content\n").unwrap();
+    service
+        .save_version(root, "SHA-256 EasilyGit version")
+        .unwrap();
+    let native_log = String::from_utf8(git(root, &["log", "--all", "--format=%s"])).unwrap();
+    assert!(!native_log.contains("SHA-256 EasilyGit version"));
+    service.restore(root, &initial_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "first content\n"
+    );
+}
+
+#[test]
 fn using_an_existing_repository_preserves_head_branch_and_git_index() {
     let directory = tempdir().unwrap();
     let root = directory.path();
@@ -167,7 +263,7 @@ fn using_an_existing_repository_preserves_head_branch_and_git_index() {
     let initial_checkpoint = enabled
         .checkpoints
         .iter()
-        .find(|checkpoint| checkpoint.label == "项目初始版本")
+        .find(|checkpoint| checkpoint.label == "开始使用 EasilyGit")
         .unwrap()
         .id
         .clone();
@@ -180,6 +276,10 @@ fn using_an_existing_repository_preserves_head_branch_and_git_index() {
     let staged_index = fs::read(&index_path).unwrap();
     service.save_version(root, "EasilyGit version").unwrap();
     assert_eq!(fs::read(&index_path).unwrap(), staged_index);
+    let native_log = String::from_utf8(git(root, &["log", "--all", "--format=%s"])).unwrap();
+    assert!(!native_log.contains("EasilyGit version"));
+    let app_log = String::from_utf8(git_store(root, &["log", "--all", "--format=%s"])).unwrap();
+    assert!(app_log.contains("EasilyGit version"));
 
     let restored = service.restore(root, &initial_checkpoint).unwrap();
     assert_eq!(
@@ -193,7 +293,7 @@ fn using_an_existing_repository_preserves_head_branch_and_git_index() {
 }
 
 #[test]
-fn existing_branch_history_is_shown_and_can_be_restored_without_checkout() {
+fn existing_branch_history_is_read_only_and_never_checks_out_a_branch() {
     let directory = tempdir().unwrap();
     let root = directory.path();
     fs::write(root.join("notes.txt"), "base version\n").unwrap();
@@ -225,6 +325,16 @@ fn existing_branch_history_is_shown_and_can_be_restored_without_checkout() {
     let branch_before = git(root, &["symbolic-ref", "HEAD"]);
     let service = ProjectService::new(SystemGitBackend);
     let enabled = service.enable_protection(root).unwrap();
+    let easilygit_git_refs = String::from_utf8(git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/easilygit/checkpoints/git-",
+        ],
+    ))
+    .unwrap();
+    assert!(easilygit_git_refs.trim().is_empty());
     let labels: Vec<&str> = enabled
         .checkpoints
         .iter()
@@ -244,15 +354,15 @@ fn existing_branch_history_is_shown_and_can_be_restored_without_checkout() {
         .clone();
     let index_path = root.join(".git/index");
     let index_before = fs::read(&index_path).unwrap();
-    let restored = service.restore(root, &alternate_id).unwrap();
+    let restore_error = service.restore(root, &alternate_id).unwrap_err();
+    assert_eq!(restore_error.code(), "CHECKPOINT_READ_ONLY");
     assert_eq!(
         fs::read_to_string(root.join("notes.txt")).unwrap(),
-        "alternate branch version\n"
+        "main branch version\n"
     );
     assert_eq!(fs::read(&index_path).unwrap(), index_before);
     assert_eq!(git(root, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(git(root, &["symbolic-ref", "HEAD"]), branch_before);
-    assert!(restored.can_undo_restore);
 
     fs::write(root.join("later.txt"), "later change\n").unwrap();
     git(root, &["add", "--all"]);
@@ -281,4 +391,289 @@ fn existing_branch_history_is_shown_and_can_be_restored_without_checkout() {
             .trim(),
         "alternate"
     );
+}
+
+#[test]
+fn stopping_protection_removes_easilygit_records_and_preserves_the_git_repository() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "keep this file\n").unwrap();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "Existing Git User"]);
+    git(root, &["config", "user.email", "existing@example.test"]);
+    git(root, &["add", "notes.txt"]);
+    git(root, &["commit", "--quiet", "-m", "Original Git commit"]);
+
+    let service = ProjectService::new(SystemGitBackend);
+    service.enable_protection(root).unwrap();
+    service
+        .save_version(root, "EasilyGit version to remove")
+        .unwrap();
+
+    let head_before = git(root, &["rev-parse", "HEAD"]);
+    let branch_before = git(root, &["symbolic-ref", "HEAD"]);
+    let index_before = fs::read(root.join(".git/index")).unwrap();
+    let metadata_path = root.join(".git/easilygit/metadata.json");
+    assert!(metadata_path.exists());
+    assert!(
+        String::from_utf8(git(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/easilygit/checkpoints"
+            ]
+        ))
+        .unwrap()
+        .trim()
+        .is_empty()
+    );
+    assert!(
+        !String::from_utf8(git_store(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/easilygit/checkpoints"
+            ]
+        ))
+        .unwrap()
+        .trim()
+        .is_empty()
+    );
+    let native_log = String::from_utf8(git(root, &["log", "--all", "--format=%s"])).unwrap();
+    assert!(!native_log.contains("EasilyGit version to remove"));
+
+    let stopped = service.disable_protection(root).unwrap();
+    assert!(!stopped.initialized);
+    assert!(stopped.is_git_repository);
+    assert!(!metadata_path.exists());
+    assert!(!root.join(".git/easilygit").exists());
+    assert!(
+        String::from_utf8(git(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/easilygit/checkpoints"
+            ]
+        ))
+        .unwrap()
+        .trim()
+        .is_empty()
+    );
+    assert_eq!(git(root, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(git(root, &["symbolic-ref", "HEAD"]), branch_before);
+    assert_eq!(fs::read(root.join(".git/index")).unwrap(), index_before);
+    assert_eq!(
+        fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "keep this file\n"
+    );
+    let remaining_log = String::from_utf8(git(root, &["log", "--all", "--format=%s"])).unwrap();
+    assert!(remaining_log.contains("Original Git commit"));
+    assert!(!remaining_log.contains("EasilyGit version to remove"));
+}
+
+#[test]
+fn legacy_easilygit_refs_are_moved_out_of_the_users_repository() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "original content\n").unwrap();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "Existing Git User"]);
+    git(root, &["config", "user.email", "existing@example.test"]);
+    git(root, &["add", "notes.txt"]);
+    git(root, &["commit", "--quiet", "-m", "Original Git commit"]);
+    let head = String::from_utf8(git(root, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let tree = String::from_utf8(git(root, &["rev-parse", "HEAD^{tree}"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let legacy_commit = Command::new("git")
+        .args([
+            "commit-tree",
+            &tree,
+            "-p",
+            &head,
+            "-m",
+            "Legacy EasilyGit version",
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        legacy_commit.status.success(),
+        "git commit-tree failed: {}",
+        String::from_utf8_lossy(&legacy_commit.stderr)
+    );
+    let legacy_commit = String::from_utf8(legacy_commit.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(
+        root,
+        &[
+            "update-ref",
+            "refs/easilygit/checkpoints/legacy-id",
+            &legacy_commit,
+        ],
+    );
+    fs::create_dir_all(root.join(".git/easilygit")).unwrap();
+    fs::write(
+        root.join(".git/easilygit/metadata.json"),
+        r#"{"version":2,"checkpoints":[{"id":"legacy-id","label":"Legacy EasilyGit version","createdAt":"2026-01-01T00:00:00Z","kind":"user"}],"currentCheckpoint":"legacy-id"}"#,
+    )
+    .unwrap();
+
+    let service = ProjectService::new(SystemGitBackend);
+    let state = service.refresh(root).unwrap();
+    assert!(state.checkpoints.iter().any(|checkpoint| {
+        checkpoint.id == "legacy-id" && checkpoint.label == "Legacy EasilyGit version"
+    }));
+    assert!(
+        String::from_utf8(git(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/easilygit/checkpoints",
+            ]
+        ))
+        .unwrap()
+        .trim()
+        .is_empty()
+    );
+    assert!(
+        String::from_utf8(git_store(
+            root,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/easilygit/checkpoints",
+            ]
+        ))
+        .unwrap()
+        .contains("refs/easilygit/checkpoints/legacy-id")
+    );
+    let native_log = String::from_utf8(git(root, &["log", "--all", "--format=%s"])).unwrap();
+    assert!(!native_log.contains("Legacy EasilyGit version"));
+    service.restore(root, "legacy-id").unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "original content\n"
+    );
+}
+
+#[test]
+fn excluded_files_stay_on_disk_and_are_untouched_by_easilygit_saves_and_restores() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "original notes\n").unwrap();
+    fs::write(root.join("generated.txt"), "original generated\n").unwrap();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "Existing Git User"]);
+    git(root, &["config", "user.email", "existing@example.test"]);
+    git(root, &["add", "--all"]);
+    git(root, &["commit", "--quiet", "-m", "Initial Git commit"]);
+
+    let service = ProjectService::new(SystemGitBackend);
+    let initial = service.enable_protection(root).unwrap();
+    let initial_id = initial
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.kind == easilygit_domain::CheckpointKind::User)
+        .unwrap()
+        .id
+        .clone();
+    let index_path = root.join(".git/index");
+    let index_before = fs::read(&index_path).unwrap();
+
+    let after_excluding = service
+        .set_file_managed(root, "generated.txt", false)
+        .unwrap();
+    assert!(after_excluding.current_changes.is_empty());
+    let files = service.managed_files(root).unwrap();
+    assert!(
+        files
+            .iter()
+            .any(|file| file.path == "generated.txt" && !file.managed)
+    );
+
+    fs::write(root.join("generated.txt"), "outside EasilyGit\n").unwrap();
+    fs::write(root.join("notes.txt"), "saved notes\n").unwrap();
+    let changed = service.refresh(root).unwrap();
+    assert_eq!(changed.current_changes.len(), 1);
+    assert_eq!(changed.current_changes[0].path, "notes.txt");
+    let saved = service.save_version(root, "Notes update").unwrap();
+    assert!(saved.current_changes.is_empty());
+
+    fs::write(root.join("generated.txt"), "keep this latest content\n").unwrap();
+    fs::write(root.join("notes.txt"), "unsaved notes\n").unwrap();
+    service.restore(root, &initial_id).unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("generated.txt")).unwrap(),
+        "keep this latest content\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("notes.txt")).unwrap(),
+        "original notes\n"
+    );
+    assert_eq!(fs::read(&index_path).unwrap(), index_before);
+
+    let reenabled = service
+        .set_file_managed(root, "generated.txt", true)
+        .unwrap();
+    assert!(
+        reenabled
+            .current_changes
+            .iter()
+            .any(|file| file.path == "generated.txt")
+    );
+}
+
+#[test]
+fn large_git_histories_are_loaded_in_pages() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "history\n").unwrap();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "History User"]);
+    git(root, &["config", "user.email", "history@example.test"]);
+    git(root, &["add", "notes.txt"]);
+    git(root, &["commit", "--quiet", "-m", "History 000"]);
+    for index in 1..125 {
+        let label = format!("History {index:03}");
+        git(root, &["commit", "--quiet", "--allow-empty", "-m", &label]);
+    }
+
+    let service = ProjectService::new(SystemGitBackend);
+    let first = service.enable_protection(root).unwrap();
+    assert_eq!(first.checkpoints.len(), 50);
+    assert!(first.has_more_checkpoints);
+
+    let second = service
+        .load_more_checkpoints(root, first.checkpoints.len())
+        .unwrap();
+    assert_eq!(second.checkpoints.len(), 50);
+    assert!(second.has_more);
+    let third = service
+        .load_more_checkpoints(root, first.checkpoints.len() + second.checkpoints.len())
+        .unwrap();
+    assert_eq!(third.checkpoints.len(), 26);
+    assert!(!third.has_more);
+
+    let mut ids: Vec<String> = first
+        .checkpoints
+        .iter()
+        .chain(second.checkpoints.iter())
+        .chain(third.checkpoints.iter())
+        .map(|checkpoint| checkpoint.id.clone())
+        .collect();
+    let count_with_duplicates = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), count_with_duplicates);
 }

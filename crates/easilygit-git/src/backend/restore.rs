@@ -4,12 +4,12 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use easilygit_domain::{AppError, AppResult};
+use easilygit_domain::{AppError, AppResult, CheckpointKind};
 use tempfile::tempdir;
 
 use crate::{SystemGitBackend, metadata};
 
-use super::{commands, snapshot};
+use super::{commands, files, snapshot};
 
 pub(super) fn restore_checkpoint(
     backend: &SystemGitBackend,
@@ -17,12 +17,15 @@ pub(super) fn restore_checkpoint(
     id: &str,
 ) -> AppResult<()> {
     let (metadata_path, mut metadata) = backend.load_metadata(root)?;
-    if !metadata
+    let Some(checkpoint) = metadata
         .checkpoints
         .iter()
-        .any(|checkpoint| checkpoint.id == id)
-    {
+        .find(|checkpoint| checkpoint.id == id)
+    else {
         return Err(AppError::CheckpointNotFound);
+    };
+    if checkpoint.kind == CheckpointKind::Git {
+        return Err(AppError::CheckpointReadOnly);
     }
     let target_commit = commit_for(root, id)?;
     let previous_restore_backup = metadata.last_restore_backup.clone();
@@ -36,11 +39,13 @@ pub(super) fn restore_checkpoint(
     metadata.current_checkpoint = Some(id.to_owned());
     metadata::save(&metadata_path, &metadata)?;
 
-    match apply_commit(root, &target_commit) {
+    match apply_commit(root, &target_commit, &metadata.excluded_paths) {
         Ok(()) => Ok(()),
         Err(error) => {
             let backup_commit = commit_for(root, &backup.id)?;
-            if let Err(rollback_error) = apply_commit(root, &backup_commit) {
+            if let Err(rollback_error) =
+                apply_commit(root, &backup_commit, &metadata.excluded_paths)
+            {
                 metadata.current_checkpoint = None;
                 let metadata_error = metadata::save(&metadata_path, &metadata).err();
                 return Err(AppError::RestoreFailed(format!(
@@ -76,11 +81,13 @@ pub(super) fn undo_restore(backend: &SystemGitBackend, root: &Path) -> AppResult
     metadata.current_checkpoint = Some(backup_id.clone());
     metadata::save(&metadata_path, &metadata)?;
 
-    match apply_commit(root, &target_commit) {
+    match apply_commit(root, &target_commit, &metadata.excluded_paths) {
         Ok(()) => Ok(()),
         Err(error) => {
             let current_commit = commit_for(root, &current.id)?;
-            if let Err(rollback_error) = apply_commit(root, &current_commit) {
+            if let Err(rollback_error) =
+                apply_commit(root, &current_commit, &metadata.excluded_paths)
+            {
                 metadata.current_checkpoint = None;
                 metadata.last_restore_backup = Some(current.id.clone());
                 let metadata_error = metadata::save(&metadata_path, &metadata).err();
@@ -100,19 +107,18 @@ pub(super) fn undo_restore(backend: &SystemGitBackend, root: &Path) -> AppResult
 }
 
 fn commit_for(root: &Path, id: &str) -> AppResult<String> {
-    let reference = commands::checkpoint_ref(id);
-    let output = commands::output(root, &["rev-parse", "--verify", &reference], &[])?;
-    if !output.status.success() {
-        return Err(AppError::CheckpointNotFound);
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim().to_owned())
-        .map_err(|_| AppError::Git("Git returned an invalid checkpoint id".into()))
+    commands::checkpoint_commit(root, id)?.ok_or(AppError::CheckpointNotFound)
 }
 
-fn apply_commit(root: &Path, commit: &str) -> AppResult<()> {
-    let target_paths = tree_paths(root, commit)?;
-    let current_paths = worktree_paths(root)?;
+fn apply_commit(root: &Path, commit: &str, excluded_paths: &[String]) -> AppResult<()> {
+    let target_paths: Vec<String> = tree_paths(root, commit)?
+        .into_iter()
+        .filter(|path| !files::is_excluded(path, excluded_paths))
+        .collect();
+    let current_paths: Vec<String> = worktree_paths(root)?
+        .into_iter()
+        .filter(|path| !files::is_excluded(path, excluded_paths))
+        .collect();
     let target_set: HashSet<&str> = target_paths.iter().map(String::as_str).collect();
     let current_set: HashSet<&str> = current_paths.iter().map(String::as_str).collect();
 
@@ -166,15 +172,17 @@ fn apply_commit(root: &Path, commit: &str) -> AppResult<()> {
 
     let temporary = tempdir().map_err(|error| AppError::Internal(error.to_string()))?;
     let index_path = temporary.path().join("restore-index");
-    let envs = [commands::index_env(&index_path)];
+    let mut envs = commands::app_environment(root)?;
+    envs.push(commands::index_env(&index_path));
     commands::run_git_with_env(root, &["read-tree", commit], &envs).map_err(as_restore_error)?;
+    files::apply_exclusions(root, &envs, excluded_paths).map_err(as_restore_error)?;
     commands::run_git_with_env(root, &["checkout-index", "--all", "--force"], &envs)
         .map_err(as_restore_error)?;
     Ok(())
 }
 
 fn tree_paths(root: &Path, commit: &str) -> AppResult<Vec<String>> {
-    let bytes = commands::run_git(root, &["ls-tree", "-r", "-z", "--name-only", commit])?;
+    let bytes = commands::app_run_git(root, &["ls-tree", "-r", "-z", "--name-only", commit])?;
     bytes
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())

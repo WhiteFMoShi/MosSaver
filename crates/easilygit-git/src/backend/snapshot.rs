@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::metadata::Metadata;
 
-use super::{SystemGitBackend, commands};
+use super::{SystemGitBackend, commands, files};
 
 pub(super) fn create_checkpoint(
     backend: &SystemGitBackend,
@@ -28,8 +28,8 @@ pub(super) fn write_checkpoint(
 ) -> AppResult<Checkpoint> {
     let temporary = tempdir().map_err(|error| AppError::Internal(error.to_string()))?;
     let index_path = temporary.path().join("index");
-    let index_env = commands::index_env(&index_path);
-    let envs = [index_env];
+    let mut envs = commands::app_environment(root)?;
+    envs.push(commands::index_env(&index_path));
 
     if let Some(head) = head_commit(root) {
         commands::run_git_with_env(root, &["read-tree", &head], &envs)?;
@@ -37,6 +37,7 @@ pub(super) fn write_checkpoint(
         commands::run_git_with_env(root, &["read-tree", "--empty"], &envs)?;
     }
     commands::run_git_with_env(root, &["add", "--all", "--", "."], &envs)?;
+    files::apply_exclusions(root, &envs, &metadata.excluded_paths)?;
     let tree = output_text(root, &["write-tree"], &envs)?;
     let id = Uuid::new_v4().simple().to_string();
     let mut commit_args = vec!["commit-tree".to_owned(), tree];
@@ -57,10 +58,12 @@ pub(super) fn write_checkpoint(
     commit_args.push(effective_label.to_owned());
     let commit_args: Vec<&str> = commit_args.iter().map(String::as_str).collect();
     let identity = commands::identity_env();
-    let commit = output_text(root, &commit_args, &identity)?;
+    let mut commit_envs = envs.clone();
+    commit_envs.extend(identity);
+    let commit = output_text(root, &commit_args, &commit_envs)?;
     let reference = commands::checkpoint_ref(&id);
-    commands::run_git(root, &["update-ref", &reference, &commit])?;
-    let created_at = output_text(root, &["show", "-s", "--format=%cI", &commit], &[])?;
+    commands::run_git_with_env(root, &["update-ref", &reference, &commit], &envs)?;
+    let created_at = output_text(root, &["show", "-s", "--format=%cI", &commit], &envs)?;
 
     let checkpoint = Checkpoint {
         id,

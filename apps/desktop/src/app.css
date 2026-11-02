@@ -113,6 +113,10 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(77, 125, 94, .34
 .panel-heading { display: flex; min-height: 76px; align-items: center; justify-content: space-between; padding: 17px 19px 14px; border-bottom: 1px solid #f0f1ed; }
 .panel-heading h2 { margin: 0 0 5px; color: #333b33; font-size: 13px; font-weight: 700; }
 .panel-heading p { margin: 0; color: #969a93; font-size: 10px; }
+.panel-heading-actions { display: flex; align-items: center; gap: 8px; }
+.text-button { padding: 5px 7px; border: 0; border-radius: 6px; color: #66816a; background: transparent; cursor: pointer; font-size: 10px; font-weight: 650; }
+.text-button:hover { background: #f1f5ef; }
+.text-button:disabled { cursor: default; opacity: .55; }
 .count-badge { display: grid; min-width: 24px; height: 24px; place-items: center; padding: 0 6px; border-radius: 8px; color: #647765; background: #edf2eb; font-size: 10px; font-weight: 700; }
 .history-total { color: #989d94; font-size: 10px; }
 .empty-changes, .empty-history { display: flex; min-height: 260px; flex-direction: column; align-items: center; justify-content: center; color: #949990; text-align: center; }
@@ -147,12 +151,20 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(77, 125, 94, .34
 .latest-badge { padding: 3px 6px; border-radius: 5px; color: #6d8c70; background: #edf4ec; font-size: 8px; }
 .timeline-time { margin: 5px 0 0; color: #9da199; font-size: 9px; }
 .automatic-note { display: inline-block; margin-top: 5px; color: #bd9b68; font-size: 9px; }
+.readonly-note { display: inline-block; margin-top: 7px; padding: 3px 6px; border-radius: 5px; color: #a18356; background: #faf5eb; font-size: 9px; }
+.load-more-button { display: block; margin: 0 auto 17px; padding: 8px 12px; border: 1px solid #e5e9e2; border-radius: 7px; color: #67806b; background: #fbfcfa; cursor: pointer; font-size: 10px; }
+.load-more-button:hover { border-color: #cfdacd; background: #f4f8f2; }
+.load-more-button:disabled { cursor: default; opacity: .55; }
 .restore-link { display: inline-flex; align-items: center; gap: 5px; margin-top: 10px; padding: 0; border: 0; color: #69846d; background: transparent; cursor: pointer; font-size: 10px; font-weight: 600; }
 .restore-link:hover { color: #45664c; }
 .restore-link:disabled { cursor: default; opacity: .55; }
 .restore-link svg { width: 14px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
-.local-footer { display: flex; justify-content: center; align-items: center; gap: 7px; margin: 16px 0 0; color: #a0a49b; font-size: 10px; }
+.local-footer { display: flex; justify-content: space-between; align-items: center; margin: 16px 0 0; color: #a0a49b; font-size: 10px; }
+.local-footer > span { display: inline-flex; align-items: center; gap: 7px; }
 .local-footer .privacy-dot { width: 6px; height: 6px; }
+.stop-protection-link { padding: 5px 0 5px 8px; border: 0; color: #a38a85; background: transparent; cursor: pointer; font-size: 10px; }
+.stop-protection-link:hover { color: #9c5550; }
+.stop-protection-link:disabled { cursor: default; opacity: .55; }
 .loading-indicator { position: fixed; right: 22px; bottom: 20px; display: flex; align-items: center; gap: 8px; padding: 9px 12px; border: 1px solid #e6e9e1; border-radius: 20px; color: #788477; background: #fff; box-shadow: 0 4px 14px rgba(40, 55, 40, .09); font-size: 10px; }
 .loading-indicator span { width: 9px; height: 9px; border: 1.5px solid #cbd9cb; border-top-color: #64836a; border-radius: 50%; animation: spin .8s linear infinite; }
 
@@ -165,6 +177,26 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(77, 125, 94, .34
 .confirm-modal strong { color: #5e6a5c; font-weight: 650; }
 .modal-error { margin-top: 13px !important; color: #a75854 !important; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 25px; }
+.modal-icon-danger { color: #a75954; background: #fbefed; font-size: 22px; font-weight: 700; }
+.button-danger { color: #fff; background: #a95f5b; }
+.button-danger:not(:disabled):hover { background: #934c48; }
+.file-manager-modal { display: flex; width: min(100%, 680px); max-height: min(82vh, 760px); flex-direction: column; margin: 0; padding: 24px; overflow: hidden; border: 1px solid rgba(255,255,255,.7); border-radius: 16px; background: #fff; box-shadow: 0 18px 60px rgba(31, 43, 32, .2); }
+.file-manager-heading { display: flex; align-items: center; justify-content: space-between; padding-bottom: 14px; border-bottom: 1px solid #edf0ea; }
+.file-manager-heading .eyebrow { margin-bottom: 4px; font-size: 9px; }
+.file-manager-heading h2 { margin: 0; color: #333b33; font-size: 17px; }
+.file-manager-description { margin: 13px 0; color: #81877d; font-size: 11px; line-height: 1.7; }
+.managed-file-list { min-height: 0; flex: 1; overflow: auto; margin: 0; padding: 0; border-top: 1px solid #f1f2ef; list-style: none; }
+.managed-file-list li { display: flex; min-height: 52px; align-items: center; gap: 12px; padding: 7px 5px; border-bottom: 1px solid #f1f2ef; }
+.managed-file-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
+.managed-file-name { overflow: hidden; color: #4c554c; font-size: 11px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.managed-file-path { overflow: hidden; color: #9a9f96; font: 9px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.file-rule-button { flex: 0 0 auto; padding: 6px 9px; border: 1px solid #ecdedb; border-radius: 6px; color: #a1635e; background: #fff9f8; cursor: pointer; font-size: 9px; }
+.file-rule-button:hover { background: #fdf0ee; }
+.file-rule-button:disabled { cursor: default; opacity: .55; }
+.file-rule-enable { border-color: #dfe8dc; color: #648069; background: #f8fbf7; }
+.file-rule-enable:hover { background: #eef5ec; }
+.empty-managed-files { display: grid; min-height: 150px; place-items: center; color: #9a9f96; font-size: 11px; }
+.file-manager-modal .modal-actions { margin-top: 15px; }
 
 @media (max-width: 900px) {
   .app-shell { padding-right: 28px; padding-left: 28px; }
@@ -198,4 +230,7 @@ button:focus-visible, a:focus-visible { outline: 3px solid rgba(77, 125, 94, .34
   .file-row { grid-template-columns: 20px minmax(60px, .5fr) minmax(0, 1fr); padding: 0 12px; }
   .modal-actions { flex-direction: column-reverse; }
   .modal-actions .button { width: 100%; }
+  .file-manager-modal { max-height: 88vh; padding: 18px; }
+  .local-footer { gap: 10px; align-items: flex-start; }
+  .stop-protection-link { text-align: right; }
 }

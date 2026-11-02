@@ -1,5 +1,7 @@
 mod commands;
+mod files;
 mod history;
+mod management;
 mod restore;
 mod snapshot;
 mod status;
@@ -7,7 +9,9 @@ mod status;
 use std::path::{Path, PathBuf};
 
 use easilygit_app::ProjectPort;
-use easilygit_domain::{AppError, AppResult, ChangedFile, Checkpoint};
+use easilygit_domain::{
+    AppError, AppResult, ChangedFile, Checkpoint, CheckpointKind, CheckpointPage, ManagedFile,
+};
 
 use crate::metadata::{self, Metadata};
 
@@ -72,51 +76,64 @@ impl ProjectPort for SystemGitBackend {
 
     fn current_changes(&self, root: &Path) -> AppResult<Vec<ChangedFile>> {
         let (_, metadata) = self.load_metadata(root)?;
-        let mut checkpoint_id = match metadata.current_checkpoint {
-            Some(id) if commands::reference_exists(root, &id)? => Some(id),
+        let mut checkpoint = match metadata.current_checkpoint {
+            Some(id) => commands::checkpoint_commit(root, &id)?,
             _ => None,
         };
-        if checkpoint_id.is_none() {
+        if checkpoint.is_none() {
             let mut checkpoints = Vec::new();
             for checkpoint in metadata.checkpoints {
-                if commands::reference_exists(root, &checkpoint.id)? {
-                    checkpoints.push(checkpoint);
+                if let Some(commit) = commands::checkpoint_commit(root, &checkpoint.id)? {
+                    checkpoints.push((checkpoint, commit));
                 }
             }
-            checkpoint_id = checkpoints
+            checkpoint = checkpoints
                 .iter()
-                .max_by(|left, right| {
+                .max_by(|(left, _), (right, _)| {
                     left.created_at
                         .cmp(&right.created_at)
                         .then_with(|| left.id.cmp(&right.id))
                 })
-                .map(|checkpoint| checkpoint.id.clone());
+                .map(|(_, commit)| commit.clone());
         }
-        let base = checkpoint_id
-            .map(|id| commands::checkpoint_ref(&id))
-            .or_else(|| snapshot::head_commit(root));
-        status::current_changes(root, base.as_deref())
+        let base = checkpoint.or_else(|| snapshot::head_commit(root));
+        status::current_changes(root, base.as_deref(), &metadata.excluded_paths)
     }
 
-    fn checkpoints(&self, root: &Path) -> AppResult<Vec<Checkpoint>> {
+    fn checkpoints_page(
+        &self,
+        root: &Path,
+        offset: usize,
+        limit: usize,
+    ) -> AppResult<CheckpointPage> {
         let (metadata_path, mut metadata) = self.load_metadata(root)?;
-        if history::update_existing_history(root, &mut metadata)? {
+        let mut changed = history::update_existing_history(root, &mut metadata)?;
+        let required = offset.saturating_add(limit);
+        let mut visible = valid_visible_checkpoints(root, &metadata)?;
+        while visible.len() < required && metadata.git_history_has_more {
+            if !history::load_next_history_page(root, &mut metadata)? {
+                break;
+            }
+            changed = true;
+            visible = valid_visible_checkpoints(root, &metadata)?;
+        }
+        if changed {
             self.save_metadata(&metadata_path, &metadata)?;
         }
-        let mut valid_checkpoints = Vec::with_capacity(metadata.checkpoints.len());
-        for checkpoint in metadata.checkpoints {
-            if commands::reference_exists(root, &checkpoint.id)? {
-                valid_checkpoints.push(checkpoint);
-            }
-        }
-        metadata.checkpoints = valid_checkpoints;
-        metadata.checkpoints.sort_by(|left, right| {
-            right
-                .created_at
-                .cmp(&left.created_at)
-                .then_with(|| right.id.cmp(&left.id))
-        });
-        Ok(metadata.checkpoints)
+        let has_more =
+            visible.len() > offset.saturating_add(limit) || metadata.git_history_has_more;
+        Ok(CheckpointPage {
+            checkpoints: visible.into_iter().skip(offset).take(limit).collect(),
+            has_more,
+        })
+    }
+
+    fn has_user_checkpoint(&self, root: &Path) -> AppResult<bool> {
+        let (_, metadata) = self.load_metadata(root)?;
+        let references = commands::checkpoint_reference_ids(root)?;
+        Ok(metadata.checkpoints.iter().any(|checkpoint| {
+            checkpoint.kind == CheckpointKind::User && references.contains(&checkpoint.id)
+        }))
     }
 
     fn create_checkpoint(
@@ -143,4 +160,55 @@ impl ProjectPort for SystemGitBackend {
             None => Ok(false),
         }
     }
+
+    fn managed_files(&self, root: &Path) -> AppResult<Vec<ManagedFile>> {
+        let (_, metadata) = self.load_metadata(root)?;
+        files::list_managed_files(root, &metadata)
+    }
+
+    fn set_file_managed(&self, root: &Path, file_path: &str, managed: bool) -> AppResult<()> {
+        let (metadata_path, mut metadata) = self.load_metadata(root)?;
+        if files::set_managed(&mut metadata, file_path, managed)? {
+            self.save_metadata(&metadata_path, &metadata)?;
+        }
+        Ok(())
+    }
+
+    fn disable_protection(&self, root: &Path) -> AppResult<()> {
+        let (metadata_path, _) = self.load_metadata(root)?;
+        management::disable_protection(root, &metadata_path)
+    }
+}
+
+fn valid_visible_checkpoints(
+    root: &Path,
+    metadata: &crate::metadata::Metadata,
+) -> AppResult<Vec<Checkpoint>> {
+    let references = commands::checkpoint_reference_ids(root)?;
+    let history_order: std::collections::HashMap<&str, usize> = metadata
+        .git_history_order
+        .iter()
+        .enumerate()
+        .map(|(position, id)| (id.as_str(), position))
+        .collect();
+    let mut checkpoints = Vec::new();
+    for checkpoint in &metadata.checkpoints {
+        if checkpoint.kind != CheckpointKind::Automatic
+            && (checkpoint.kind == CheckpointKind::Git || references.contains(&checkpoint.id))
+        {
+            checkpoints.push(checkpoint.clone());
+        }
+    }
+    checkpoints.sort_by(|left, right| {
+        if left.kind == CheckpointKind::Git && right.kind == CheckpointKind::Git {
+            return history_order
+                .get(left.id.as_str())
+                .cmp(&history_order.get(right.id.as_str()));
+        }
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(checkpoints)
 }

@@ -18,6 +18,16 @@
     kind: "user" | "git" | "automatic";
   }
 
+  interface CheckpointPage {
+    checkpoints: Checkpoint[];
+    hasMore: boolean;
+  }
+
+  interface ManagedFile {
+    path: string;
+    managed: boolean;
+  }
+
   interface ProjectState {
     root: string;
     name: string;
@@ -25,6 +35,7 @@
     isGitRepository: boolean;
     currentChanges: ChangedFile[];
     checkpoints: Checkpoint[];
+    hasMoreCheckpoints: boolean;
     canUndoRestore: boolean;
   }
 
@@ -33,6 +44,10 @@
   let errorMessage = $state("");
   let selectedCheckpoint = $state<Checkpoint | null>(null);
   let dialogMode = $state<"restore" | "undo" | null>(null);
+  let managedFilesOpen = $state(false);
+  let managedFiles = $state<ManagedFile[]>([]);
+  let stopProtectionOpen = $state(false);
+  let loadedCheckpointCount = 0;
   let autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingRefreshRoot: string | undefined;
 
@@ -89,9 +104,11 @@
   async function openProject(path: string) {
     await perform(async () => {
       const opened = await invoke<ProjectState>("open_project", { path });
-      project = opened;
+      await adoptProjectState(opened, 0);
       selectedCheckpoint = null;
       dialogMode = null;
+      managedFilesOpen = false;
+      stopProtectionOpen = false;
       if (opened.initialized) {
         await invoke("watch_project", { path: opened.root });
       } else {
@@ -104,25 +121,28 @@
     if (!project) return;
     await perform(async () => {
       const initialized = await invoke<ProjectState>("initialize_project", { path: project!.root });
-      project = initialized;
+      await adoptProjectState(initialized, 0);
       await invoke("watch_project", { path: initialized.root });
     });
   }
 
   async function refreshProject() {
     if (!project) return;
+    const previousCount = loadedCheckpointCount;
     await perform(async () => {
-      project = await invoke<ProjectState>("refresh_project", { path: project!.root });
+      const refreshed = await invoke<ProjectState>("refresh_project", { path: project!.root });
+      await adoptProjectState(refreshed, previousCount);
     });
   }
 
   async function saveVersion() {
     if (!project) return;
     await perform(async () => {
-      project = await invoke<ProjectState>("save_version", {
+      const saved = await invoke<ProjectState>("save_version", {
         path: project!.root,
         label: "手动保存的版本",
       });
+      await adoptProjectState(saved, loadedCheckpointCount);
     });
   }
 
@@ -130,10 +150,11 @@
     if (!project || !selectedCheckpoint) return;
     const checkpoint = selectedCheckpoint;
     await perform(async () => {
-      project = await invoke<ProjectState>("restore_checkpoint", {
+      const restored = await invoke<ProjectState>("restore_checkpoint", {
         path: project!.root,
         checkpointId: checkpoint.id,
       });
+      await adoptProjectState(restored, loadedCheckpointCount);
       selectedCheckpoint = null;
       dialogMode = null;
     });
@@ -142,7 +163,8 @@
   async function undoRestore() {
     if (!project) return;
     await perform(async () => {
-      project = await invoke<ProjectState>("undo_restore", { path: project!.root });
+      const restored = await invoke<ProjectState>("undo_restore", { path: project!.root });
+      await adoptProjectState(restored, loadedCheckpointCount);
       dialogMode = null;
     });
   }
@@ -152,8 +174,76 @@
     errorMessage = "";
     selectedCheckpoint = null;
     dialogMode = null;
+    managedFilesOpen = false;
+    stopProtectionOpen = false;
+    loadedCheckpointCount = 0;
     pendingRefreshRoot = undefined;
     void invoke("stop_project_watch").catch(() => {});
+  }
+
+  async function adoptProjectState(next: ProjectState, preserveCheckpointCount: number) {
+    let checkpoints = next.checkpoints;
+    let hasMoreCheckpoints = next.hasMoreCheckpoints;
+    while (checkpoints.length < preserveCheckpointCount && hasMoreCheckpoints) {
+      const page = await invoke<CheckpointPage>("load_more_checkpoints", {
+        path: next.root,
+        offset: checkpoints.length,
+      });
+      checkpoints = [...checkpoints, ...page.checkpoints];
+      hasMoreCheckpoints = page.hasMore;
+      if (page.checkpoints.length === 0) break;
+    }
+    project = { ...next, checkpoints, hasMoreCheckpoints };
+    loadedCheckpointCount = checkpoints.length;
+  }
+
+  async function loadMoreCheckpoints() {
+    if (!project?.hasMoreCheckpoints) return;
+    await perform(async () => {
+      const page = await invoke<CheckpointPage>("load_more_checkpoints", {
+        path: project!.root,
+        offset: project!.checkpoints.length,
+      });
+      project = {
+        ...project!,
+        checkpoints: [...project!.checkpoints, ...page.checkpoints],
+        hasMoreCheckpoints: page.hasMore,
+      };
+      loadedCheckpointCount = project.checkpoints.length;
+    });
+  }
+
+  async function openManagedFiles() {
+    if (!project) return;
+    await perform(async () => {
+      managedFiles = await invoke<ManagedFile[]>("list_managed_files", { path: project!.root });
+      managedFilesOpen = true;
+    });
+  }
+
+  async function toggleFileManagement(file: ManagedFile) {
+    if (!project) return;
+    await perform(async () => {
+      const updated = await invoke<ProjectState>("set_file_managed", {
+        path: project!.root,
+        filePath: file.path,
+        managed: !file.managed,
+      });
+      await adoptProjectState(updated, loadedCheckpointCount);
+      managedFiles = await invoke<ManagedFile[]>("list_managed_files", { path: project!.root });
+    });
+  }
+
+  async function stopProtection() {
+    if (!project) return;
+    const root = project.root;
+    await perform(async () => {
+      const stopped = await invoke<ProjectState>("disable_protection", { path: root });
+      await adoptProjectState(stopped, 0);
+      managedFilesOpen = false;
+      stopProtectionOpen = false;
+      await invoke("stop_project_watch").catch(() => {});
+    });
   }
 
   function scheduleProjectRefresh(root: string) {
@@ -204,6 +294,7 @@
         NOT_A_REPOSITORY: "这个文件夹暂时无法开启版本保护。",
         NOT_INITIALIZED: "请先为这个文件夹开启版本保护。",
         CHECKPOINT_NOT_FOUND: "找不到这个版本，它可能已经被移除。",
+        CHECKPOINT_READ_ONLY: "这是原有 Git 提交，只能查看，不能通过 EasilyGit 恢复。",
         NOTHING_TO_UNDO: "现在没有可以撤销的恢复操作。",
         INVALID_PATH: "项目中有一个文件名无法安全处理。",
         PERMISSION_DENIED: "没有权限访问项目文件，请检查文件夹权限。",
@@ -303,7 +394,7 @@
             <p class="eyebrow">只需一步</p>
             <h2>{project.isGitRepository ? "检测到已有 Git 仓库" : "为这个文件夹开启版本保护"}</h2>
             {#if project.isGitRepository}
-              <p>开启后，已有 Git 提交会加入时间线，并保存项目当前状态。EasilyGit 不会移动分支或改动暂存区。</p>
+              <p>开启后，可以只读查看已有 Git 提交，并保存项目当前状态。EasilyGit 不会移动分支或改动暂存区；恢复仅适用于 EasilyGit 保存的版本。</p>
             {:else}
               <p>开启后，你可以保存项目当前状态，并在需要时恢复。EasilyGit 会在项目中创建本地 Git 记录，不会上传任何文件。</p>
             {/if}
@@ -341,9 +432,12 @@
                 <h2>当前变化</h2>
                 <p>自上次保存后发生的修改</p>
               </div>
-              {#if project.currentChanges.length > 0}
-                <span class="count-badge">{project.currentChanges.length}</span>
-              {/if}
+              <div class="panel-heading-actions">
+                {#if project.currentChanges.length > 0}
+                  <span class="count-badge">{project.currentChanges.length}</span>
+                {/if}
+                <button class="text-button" onclick={openManagedFiles} disabled={loading}>管理文件</button>
+              </div>
             </div>
 
             {#if project.currentChanges.length === 0}
@@ -375,9 +469,9 @@
             <div class="panel-heading">
               <div>
                 <h2>已保存的版本</h2>
-                <p>EasilyGit 版本与已有 Git 提交都在这里查看和恢复</p>
+                <p>EasilyGit 版本可恢复；已有 Git 提交只读查看</p>
               </div>
-              <span class="history-total">{project.checkpoints.length} 个版本</span>
+              <span class="history-total">已加载 {project.checkpoints.length} 个版本</span>
             </div>
 
             {#if project.checkpoints.length === 0}
@@ -394,24 +488,32 @@
                     <div class="timeline-content">
                       <div class="timeline-title-row">
                         <h3>{checkpoint.label}</h3>
-                        {#if index === 0}<span class="latest-badge">最近</span>{/if}
+                        {#if index === 0}<span class="latest-badge">{checkpoint.label === "开始使用 EasilyGit" ? "保护起点" : "最近"}</span>{/if}
                       </div>
                       <p class="timeline-time">{formatTime(checkpoint.createdAt)}</p>
-                      {#if checkpoint.kind === "git"}<span class="automatic-note">Git 提交</span>{/if}
+                      {#if checkpoint.kind === "git"}<span class="readonly-note">Git 提交 · 仅查看</span>{/if}
                       {#if checkpoint.kind === "automatic"}<span class="automatic-note">自动安全保存</span>{/if}
-                      <button class="restore-link" onclick={() => { selectedCheckpoint = checkpoint; dialogMode = "restore"; }} disabled={loading}>
-                        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8a6 6 0 1 1-.2 3M4 4.5V8h3.5M10 7v3l2 1.2" /></svg>
-                        恢复到此版本
-                      </button>
+                      {#if checkpoint.kind !== "git"}
+                        <button class="restore-link" onclick={() => { selectedCheckpoint = checkpoint; dialogMode = "restore"; }} disabled={loading}>
+                          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8a6 6 0 1 1-.2 3M4 4.5V8h3.5M10 7v3l2 1.2" /></svg>
+                          恢复到此版本
+                        </button>
+                      {/if}
                     </div>
                   </li>
                 {/each}
               </ol>
+              {#if project.hasMoreCheckpoints}
+                <button class="load-more-button" onclick={loadMoreCheckpoints} disabled={loading}>加载更早的版本</button>
+              {/if}
             {/if}
           </section>
         </div>
 
-        <footer class="local-footer"><span class="privacy-dot"></span>所有版本都保存在本地电脑</footer>
+        <footer class="local-footer">
+          <span><span class="privacy-dot"></span>所有版本都保存在本地电脑</span>
+          <button class="stop-protection-link" onclick={() => stopProtectionOpen = true} disabled={loading}>停止 EasilyGit 管理</button>
+        </footer>
       {/if}
     </section>
   {/if}
@@ -435,6 +537,57 @@
       <div class="modal-actions">
         <button class="button button-quiet" onclick={() => { selectedCheckpoint = null; dialogMode = null; }} disabled={loading}>再想一想</button>
         <button class="button button-primary" onclick={dialogMode === "undo" ? undoRestore : restoreVersion} disabled={loading}>{dialogMode === "undo" ? "撤销恢复" : "恢复这个版本"}</button>
+      </div>
+    </dialog>
+  </div>
+{/if}
+
+{#if managedFilesOpen}
+  <div class="modal-backdrop" role="presentation">
+    <dialog open class="file-manager-modal" aria-modal="true" aria-labelledby="file-manager-title">
+      <div class="file-manager-heading">
+        <div>
+          <p class="eyebrow">项目文件</p>
+          <h2 id="file-manager-title">管理哪些文件</h2>
+        </div>
+        <button class="error-dismiss" onclick={() => managedFilesOpen = false} aria-label="关闭">×</button>
+      </div>
+      <p class="file-manager-description">停止管理后，文件仍保留在电脑上；EasilyGit 不再保存或恢复它。Git 自身的跟踪状态不会改变。</p>
+      {#if errorMessage}<p class="modal-error" role="alert">{errorMessage}</p>{/if}
+      {#if managedFiles.length === 0}
+        <div class="empty-managed-files">项目里还没有可管理的文件。</div>
+      {:else}
+        <ul class="managed-file-list">
+          {#each managedFiles as file (file.path)}
+            <li>
+              <div class="managed-file-copy">
+                <span class="managed-file-name" title={file.path}>{fileName(file.path)}</span>
+                <span class="managed-file-path" title={file.path}>{file.path}</span>
+              </div>
+              {#if file.managed}
+                <button class="file-rule-button" onclick={() => toggleFileManagement(file)} disabled={loading}>停止管理</button>
+              {:else}
+                <button class="file-rule-button file-rule-enable" onclick={() => toggleFileManagement(file)} disabled={loading}>恢复管理</button>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+      <div class="modal-actions"><button class="button button-quiet" onclick={() => managedFilesOpen = false}>完成</button></div>
+    </dialog>
+  </div>
+{/if}
+
+{#if stopProtectionOpen}
+  <div class="modal-backdrop" role="presentation">
+    <dialog open class="confirm-modal" aria-modal="true" aria-labelledby="stop-protection-title" aria-describedby="stop-protection-description">
+      <div class="modal-icon modal-icon-danger">!</div>
+      <h2 id="stop-protection-title">停止 EasilyGit 管理？</h2>
+      <p id="stop-protection-description">这会删除 EasilyGit 的版本记录、文件管理设置和独立存储。项目文件、普通 Git 提交、分支和暂存区会保留。旧版本写入原 Git 存储的数据，可能需要 Git 后续整理时回收。</p>
+      {#if errorMessage}<p class="modal-error" role="alert">{errorMessage}</p>{/if}
+      <div class="modal-actions">
+        <button class="button button-quiet" onclick={() => stopProtectionOpen = false} disabled={loading}>取消</button>
+        <button class="button button-danger" onclick={stopProtection} disabled={loading}>停止管理并清理记录</button>
       </div>
     </dialog>
   </div>

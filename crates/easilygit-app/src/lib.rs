@@ -1,20 +1,31 @@
 use std::path::{Path, PathBuf};
 
 use easilygit_domain::{
-    AppError, AppResult, ChangedFile, Checkpoint, CheckpointKind, ProjectState,
+    AppError, AppResult, ChangedFile, Checkpoint, CheckpointPage, ManagedFile, ProjectState,
 };
+
+const CHECKPOINT_PAGE_SIZE: usize = 50;
 
 pub trait ProjectPort: Send + Sync + 'static {
     fn repository_root(&self, path: &Path) -> AppResult<Option<PathBuf>>;
     fn initialize_repository(&self, path: &Path) -> AppResult<()>;
     fn is_protected(&self, root: &Path) -> AppResult<bool>;
     fn current_changes(&self, root: &Path) -> AppResult<Vec<ChangedFile>>;
-    fn checkpoints(&self, root: &Path) -> AppResult<Vec<Checkpoint>>;
+    fn checkpoints_page(
+        &self,
+        root: &Path,
+        offset: usize,
+        limit: usize,
+    ) -> AppResult<CheckpointPage>;
+    fn has_user_checkpoint(&self, root: &Path) -> AppResult<bool>;
     fn create_checkpoint(&self, root: &Path, label: &str, automatic: bool)
     -> AppResult<Checkpoint>;
     fn restore_checkpoint(&self, root: &Path, id: &str) -> AppResult<()>;
     fn undo_restore(&self, root: &Path) -> AppResult<()>;
     fn can_undo_restore(&self, root: &Path) -> AppResult<bool>;
+    fn managed_files(&self, root: &Path) -> AppResult<Vec<ManagedFile>>;
+    fn set_file_managed(&self, root: &Path, file_path: &str, managed: bool) -> AppResult<()>;
+    fn disable_protection(&self, root: &Path) -> AppResult<()>;
 }
 
 #[derive(Clone)]
@@ -42,13 +53,9 @@ impl<P: ProjectPort> ProjectService<P> {
             .port
             .repository_root(&selected)?
             .ok_or(AppError::NotARepository)?;
-        if !self
-            .port
-            .checkpoints(&root)?
-            .iter()
-            .any(|checkpoint| checkpoint.kind == CheckpointKind::User)
-        {
-            self.port.create_checkpoint(&root, "项目初始版本", false)?;
+        if !self.port.has_user_checkpoint(&root)? {
+            self.port
+                .create_checkpoint(&root, "开始使用 EasilyGit", false)?;
         }
         self.state_for_root(root)
     }
@@ -73,6 +80,34 @@ impl<P: ProjectPort> ProjectService<P> {
     pub fn undo_restore(&self, path: &Path) -> AppResult<ProjectState> {
         let root = self.protected_root(path)?;
         self.port.undo_restore(&root)?;
+        self.state_for_root(root)
+    }
+
+    pub fn load_more_checkpoints(&self, path: &Path, offset: usize) -> AppResult<CheckpointPage> {
+        let root = self.protected_root(path)?;
+        self.port
+            .checkpoints_page(&root, offset, CHECKPOINT_PAGE_SIZE)
+    }
+
+    pub fn managed_files(&self, path: &Path) -> AppResult<Vec<ManagedFile>> {
+        let root = self.protected_root(path)?;
+        self.port.managed_files(&root)
+    }
+
+    pub fn set_file_managed(
+        &self,
+        path: &Path,
+        file_path: &str,
+        managed: bool,
+    ) -> AppResult<ProjectState> {
+        let root = self.protected_root(path)?;
+        self.port.set_file_managed(&root, file_path, managed)?;
+        self.state_for_root(root)
+    }
+
+    pub fn disable_protection(&self, path: &Path) -> AppResult<ProjectState> {
+        let root = self.protected_root(path)?;
+        self.port.disable_protection(&root)?;
         self.state_for_root(root)
     }
 
@@ -110,16 +145,12 @@ impl<P: ProjectPort> ProjectService<P> {
                 is_git_repository,
                 current_changes: Vec::new(),
                 checkpoints: Vec::new(),
+                has_more_checkpoints: false,
                 can_undo_restore: false,
             });
         }
 
-        let checkpoints = self
-            .port
-            .checkpoints(&root)?
-            .into_iter()
-            .filter(|checkpoint| checkpoint.kind != CheckpointKind::Automatic)
-            .collect();
+        let page = self.port.checkpoints_page(&root, 0, CHECKPOINT_PAGE_SIZE)?;
 
         Ok(ProjectState {
             root: root.to_string_lossy().into_owned(),
@@ -127,7 +158,8 @@ impl<P: ProjectPort> ProjectService<P> {
             initialized: true,
             is_git_repository,
             current_changes: self.port.current_changes(&root)?,
-            checkpoints,
+            checkpoints: page.checkpoints,
+            has_more_checkpoints: page.has_more,
             can_undo_restore: self.port.can_undo_restore(&root)?,
         })
     }

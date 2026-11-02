@@ -8,7 +8,7 @@ use std::{
 };
 
 use easilygit_app::ProjectService;
-use easilygit_domain::{AppError, ProjectState};
+use easilygit_domain::{AppError, CheckpointPage, ManagedFile, ProjectState};
 use easilygit_git::SystemGitBackend;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
@@ -99,6 +99,45 @@ async fn undo_restore(
 ) -> Result<ProjectState, CommandError> {
     let service = service.inner().clone();
     run_blocking(move || service.undo_restore(&PathBuf::from(path))).await
+}
+
+#[tauri::command]
+async fn load_more_checkpoints(
+    path: String,
+    offset: usize,
+    service: State<'_, ProjectService<SystemGitBackend>>,
+) -> Result<CheckpointPage, CommandError> {
+    let service = service.inner().clone();
+    run_blocking(move || service.load_more_checkpoints(&PathBuf::from(path), offset)).await
+}
+
+#[tauri::command]
+async fn list_managed_files(
+    path: String,
+    service: State<'_, ProjectService<SystemGitBackend>>,
+) -> Result<Vec<ManagedFile>, CommandError> {
+    let service = service.inner().clone();
+    run_blocking(move || service.managed_files(&PathBuf::from(path))).await
+}
+
+#[tauri::command]
+async fn set_file_managed(
+    path: String,
+    file_path: String,
+    managed: bool,
+    service: State<'_, ProjectService<SystemGitBackend>>,
+) -> Result<ProjectState, CommandError> {
+    let service = service.inner().clone();
+    run_blocking(move || service.set_file_managed(&PathBuf::from(path), &file_path, managed)).await
+}
+
+#[tauri::command]
+async fn disable_protection(
+    path: String,
+    service: State<'_, ProjectService<SystemGitBackend>>,
+) -> Result<ProjectState, CommandError> {
+    let service = service.inner().clone();
+    run_blocking(move || service.disable_protection(&PathBuf::from(path))).await
 }
 
 #[tauri::command]
@@ -300,6 +339,10 @@ pub fn run() {
             save_version,
             restore_checkpoint,
             undo_restore,
+            load_more_checkpoints,
+            list_managed_files,
+            set_file_managed,
+            disable_protection,
             watch_project,
             stop_project_watch
         ])
@@ -322,6 +365,8 @@ mod tests {
             Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("src/main.rs"));
         let git_object_change = Event::new(EventKind::Modify(ModifyKind::Any))
             .add_path(root.join(".git/objects/ab/cdef"));
+        let easilygit_object_change = Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(root.join(".git/easilygit/store.git/objects/ab/cdef"));
         let branch_change = Event::new(EventKind::Modify(ModifyKind::Any))
             .add_path(root.join(".git/refs/heads/main"));
         let easilygit_ref_change = Event::new(EventKind::Modify(ModifyKind::Any))
@@ -331,6 +376,7 @@ mod tests {
 
         assert!(should_refresh_project(root, &source_change));
         assert!(!should_refresh_project(root, &git_object_change));
+        assert!(!should_refresh_project(root, &easilygit_object_change));
         assert!(should_refresh_project(root, &branch_change));
         assert!(!should_refresh_project(root, &easilygit_ref_change));
         assert!(!should_refresh_project(root, &outside_change));
