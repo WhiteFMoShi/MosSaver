@@ -223,6 +223,39 @@ fn repository_info_excludes_are_respected_by_easilygit() {
 }
 
 #[test]
+fn local_git_excludes_added_after_setup_still_apply_to_fast_status_checks() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "tracked by MosSaver\n").unwrap();
+    git(root, &["init", "--quiet"]);
+
+    let service = ProjectService::new(SystemGitBackend);
+    service.enable_protection(root).unwrap();
+
+    fs::write(root.join(".git/info/exclude"), "local-ignored.txt\n").unwrap();
+    fs::write(root.join("local-ignored.txt"), "locally ignored\n").unwrap();
+
+    let refreshed = service.refresh(root).unwrap();
+    assert!(refreshed.current_changes.is_empty());
+}
+
+#[test]
+fn fast_status_checks_repair_object_alternates_after_a_repository_is_moved() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("project");
+    let moved = directory.path().join("renamed-project");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("notes.txt"), "saved content\n").unwrap();
+    let service = ProjectService::new(SystemGitBackend);
+    service.enable_protection(&root).unwrap();
+
+    fs::rename(&root, &moved).unwrap();
+
+    let refreshed = service.refresh(&moved).unwrap();
+    assert!(refreshed.current_changes.is_empty());
+}
+
+#[test]
 fn sha256_git_repositories_can_be_protected() {
     let directory = tempdir().unwrap();
     let root = directory.path();

@@ -9,14 +9,14 @@ pub(super) fn current_changes(
     root: &Path,
     base: Option<&str>,
     excluded_paths: &[String],
+    app_env: &[(OsString, OsString)],
 ) -> AppResult<Vec<ChangedFile>> {
     let temporary = tempdir().map_err(|error| AppError::Internal(error.to_string()))?;
     let base_index_path = temporary.path().join("base-index");
     let current_index_path = temporary.path().join("current-index");
-    let app_env = commands::app_environment(root)?;
-    let mut base_env = app_env.clone();
+    let mut base_env = app_env.to_vec();
     base_env.push(commands::index_env(&base_index_path));
-    let mut current_env = app_env;
+    let mut current_env = app_env.to_vec();
     current_env.push(commands::index_env(&current_index_path));
 
     if let Some(base) = base {

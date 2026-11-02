@@ -355,10 +355,11 @@ fn should_refresh_project(root: &Path, event: &Event) -> bool {
         return false;
     }
 
-    event
-        .paths
-        .iter()
-        .any(|path| path.strip_prefix(root).is_ok_and(project_path_is_relevant))
+    event.paths.iter().any(|path| {
+        path.strip_prefix(root).is_ok_and(|relative| {
+            !relative.as_os_str().is_empty() && project_path_is_relevant(relative)
+        })
+    })
 }
 
 fn project_path_is_relevant(relative: &Path) -> bool {

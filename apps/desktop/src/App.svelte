@@ -2,7 +2,9 @@
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { cubicOut } from "svelte/easing";
   import { onMount } from "svelte";
+  import { fly } from "svelte/transition";
 
   type ChangeKind = "added" | "modified" | "deleted";
   type Theme = "light" | "dark";
@@ -50,6 +52,7 @@
   }
 
   let project = $state<ProjectState | null>(null);
+  let openingProjectPath = $state<string | null>(null);
   let managedPaths = $state<string[]>([]);
   let folderOverviews = $state<Record<string, ProjectOverview>>({});
   let folderErrors = $state<Record<string, string>>({});
@@ -65,7 +68,10 @@
   let loadedCheckpointCount = 0;
   let autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingRefreshRoot: string | undefined;
+  let lastFocusRefreshAt = 0;
   const overviewTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const queuedOverviewPaths = new Set<string>();
+  let overviewQueue = Promise.resolve();
 
   onMount(() => {
     let disposed = false;
@@ -86,7 +92,14 @@
       });
 
     const refreshOnFocus = () => {
-      if (project?.initialized && !loading) void refreshProject();
+      if (document.visibilityState === "hidden") return;
+      const now = Date.now();
+      if (now - lastFocusRefreshAt < 5000) return;
+      lastFocusRefreshAt = now;
+      if (project?.initialized) {
+        if (!loading) void refreshProject();
+        return;
+      }
       void refreshAllFolderOverviews();
     };
     window.addEventListener("focus", refreshOnFocus);
@@ -109,14 +122,6 @@
     deleted: "已删除",
   };
 
-  const changeCounts = $derived.by(() => {
-    const changes = project?.currentChanges ?? [];
-    return {
-      added: changes.filter((file) => file.kind === "added").length,
-      modified: changes.filter((file) => file.kind === "modified").length,
-      deleted: changes.filter((file) => file.kind === "deleted").length,
-    };
-  });
   const changedFolderCount = $derived(
     managedPaths.filter((path) => (folderOverviews[path]?.changeCount ?? 0) > 0).length,
   );
@@ -160,16 +165,24 @@
     if (managedPaths.length === 0 || refreshingFolders) return;
     refreshingFolders = true;
     try {
-      for (let index = 0; index < managedPaths.length; index += 3) {
-        const batch = managedPaths.slice(index, index + 3);
-        await Promise.all(batch.map((path) => refreshFolderOverview(path)));
-      }
+      for (const path of managedPaths) await refreshFolderOverview(path);
     } finally {
       refreshingFolders = false;
     }
   }
 
-  async function refreshFolderOverview(path: string) {
+  function refreshFolderOverview(path: string): Promise<void> {
+    if (queuedOverviewPaths.has(path)) return overviewQueue;
+    queuedOverviewPaths.add(path);
+    const refresh = overviewQueue.then(async () => {
+      queuedOverviewPaths.delete(path);
+      await readFolderOverview(path);
+    });
+    overviewQueue = refresh.then(() => {}, () => {});
+    return overviewQueue;
+  }
+
+  async function readFolderOverview(path: string) {
     try {
       const overview = await invoke<ProjectOverview>("project_overview", { path });
       folderOverviews = { ...folderOverviews, [path]: overview };
@@ -220,18 +233,25 @@
   }
 
   async function openProject(path: string) {
-    await perform(async () => {
-      const opened = await invoke<ProjectState>("open_project", { path });
-      await adoptProjectState(opened, 0);
-      selectedCheckpoint = null;
-      dialogMode = null;
-      managedFilesOpen = false;
-      stopProtectionOpen = false;
-      if (opened.initialized) {
-        await registerManagedFolder(opened.root);
-        updateFolderOverviewFromProject(opened);
-      }
-    });
+    if (loading) return;
+    openingProjectPath = path;
+    try {
+      await perform(async () => {
+        const opened = await invoke<ProjectState>("open_project", { path });
+        await adoptProjectState(opened, 0);
+        openingProjectPath = null;
+        selectedCheckpoint = null;
+        dialogMode = null;
+        managedFilesOpen = false;
+        stopProtectionOpen = false;
+        if (opened.initialized) {
+          await registerManagedFolder(opened.root);
+          updateFolderOverviewFromProject(opened);
+        }
+      });
+    } finally {
+      openingProjectPath = null;
+    }
   }
 
   async function registerManagedFolder(path: string) {
@@ -325,6 +345,7 @@
 
   function returnHome() {
     project = null;
+    openingProjectPath = null;
     errorMessage = "";
     selectedCheckpoint = null;
     dialogMode = null;
@@ -398,7 +419,7 @@
       autoRefreshTimer = undefined;
       if (loading) pendingRefreshRoot = root;
       else if (project?.initialized && project.root === root) void refreshProject();
-    }, 250);
+    }, 600);
   }
 
   function requestUndoRestore() {
@@ -485,12 +506,12 @@
 
 <main class="app-shell">
   <header class="topbar">
-    <button class="brand" aria-label="MosSaver 首页" onclick={returnHome}>
+    <button class="brand" aria-label="MosSaver 首页" onclick={returnHome} disabled={loading}>
       <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
       <span>MosSaver</span>
     </button>
     <div class="topbar-actions">
-      {#if project}
+      {#if project || openingProjectPath}
         <button class="button button-subtle back-button" onclick={returnHome} disabled={loading}>
           <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 4.5-5.5 5.5 5.5 5.5" /></svg>
           我的文件夹
@@ -522,8 +543,26 @@
     </div>
   {/if}
 
-  {#if !project}
-    <section class="home-view">
+  <div class="view-switcher">
+  {#if openingProjectPath}
+    <section class="project-view project-opening" in:fly={{ x: 14, duration: 230, easing: cubicOut }} out:fly={{ x: 10, duration: 150, easing: cubicOut }} aria-live="polite">
+      <div class="project-heading">
+        <div class="heading-copy">
+          <p class="breadcrumb">我的文件夹 <span>›</span> 正在打开</p>
+          <h1>{fileName(openingProjectPath)}</h1>
+          <p class="project-path" title={openingProjectPath}>{openingProjectPath}</p>
+        </div>
+      </div>
+      <div class="project-opening-state">
+        <span class="project-opening-spinner" aria-hidden="true"></span>
+        <div>
+          <strong>正在读取文件夹状态…</strong>
+          <p>马上就好</p>
+        </div>
+      </div>
+    </section>
+  {:else if !project}
+    <section class="home-view" in:fly={{ x: -14, duration: 230, easing: cubicOut }} out:fly={{ x: -10, duration: 150, easing: cubicOut }}>
       <div class="home-heading">
         <div>
           <p class="eyebrow">你的工作空间</p>
@@ -576,13 +615,14 @@
       {/if}
     </section>
   {:else}
-    <section class="project-view">
-      <div class="project-heading">
-        <div class="heading-copy">
-          <p class="breadcrumb">我的文件夹 <span>›</span> {project.name}</p>
-          <h1>{project.name}</h1>
-          <p class="project-path" title={project.root}>{project.root}</p>
-        </div>
+    <section class="project-view" in:fly={{ x: 14, duration: 230, easing: cubicOut }} out:fly={{ x: 10, duration: 150, easing: cubicOut }}>
+      <div class:project-heading-compact={project.initialized} class="project-heading">
+        {#if !project.initialized}
+          <div class="heading-copy">
+            <h1>{project.name}</h1>
+            <p class="project-path" title={project.root}>{project.root}</p>
+          </div>
+        {/if}
         {#if project.initialized}
           <div class="project-heading-actions">
             {#if project.canUndoRestore}
@@ -624,9 +664,8 @@
         <div class="content-grid">
           <section class="panel changes-panel">
             <div class="panel-heading">
-              <div><h2>文件变化</h2><p>自上次保存后发生的修改</p></div>
+              <div><h2>文件变化 <span class="panel-context">{project.name}</span></h2><p>项目中的修改会显示在这里</p></div>
               <div class="panel-heading-actions">
-                {#if project.currentChanges.length > 0}<span class="count-badge">{project.currentChanges.length}</span>{/if}
                 <button class="text-button" onclick={openManagedFiles} disabled={loading}>管理文件</button>
               </div>
             </div>
@@ -645,17 +684,12 @@
                   </li>
                 {/each}
               </ul>
-              <div class="change-legend">
-                {#if changeCounts.added > 0}<span class="legend-added">{changeCounts.added} 新增</span>{/if}
-                {#if changeCounts.modified > 0}<span class="legend-modified">{changeCounts.modified} 修改</span>{/if}
-                {#if changeCounts.deleted > 0}<span class="legend-deleted">{changeCounts.deleted} 删除</span>{/if}
-              </div>
             {/if}
           </section>
 
           <section class="panel history-panel">
             <div class="panel-heading">
-              <div><h2>保存记录</h2><p>MosSaver 版本可恢复 · 原有 Git 提交仅查看</p></div>
+              <div><h2>保存记录</h2><p>MosSaver 版本可恢复 · Git 提交仅查看</p></div>
               <span class="history-total">{project.checkpoints.length}{project.hasMoreCheckpoints ? "+" : ""} 个</span>
             </div>
             {#if project.checkpoints.length === 0}
@@ -711,12 +745,16 @@
       {/if}
     </section>
   {/if}
+  </div>
 
   <footer class="app-statusbar" aria-label="应用状态" aria-live="polite">
     <div class="statusbar-left">
       <strong>MosSaver</strong>
       {#if project?.initialized}
-        <span class="statusbar-divider"></span><span>{project.name}</span>
+        <span class="statusbar-divider"></span><span class="statusbar-path" title={project.root}>{project.root}</span>
+      {:else if openingProjectPath}
+        <span class="statusbar-divider"></span><span>{fileName(openingProjectPath)}</span>
+        <span class="statusbar-divider"></span><span class="statusbar-path" title={openingProjectPath}>{openingProjectPath}</span>
       {:else if !project && managedPaths.length > 0}
         <span class="statusbar-divider"></span><span>{managedPaths.length} 个文件夹</span>
       {/if}

@@ -34,6 +34,21 @@ pub(super) fn output(
 
 pub(super) fn app_environment(root: &Path) -> AppResult<Vec<(OsString, OsString)>> {
     let store_path = git_path(root, "easilygit/store.git")?;
+    let environment = vec![
+        (OsString::from("GIT_DIR"), store_path.as_os_str().to_owned()),
+        (OsString::from("GIT_WORK_TREE"), root.as_os_str().to_owned()),
+    ];
+
+    // Status checks run often. Once storage has been initialized and legacy
+    // references have been migrated, keep only the path-dependent checks that
+    // matter when a repository is moved or its local excludes change.
+    if store_path.join("HEAD").is_file() && store_path.join("easilygit-storage-v1").is_file() {
+        let object_dir = git_path(root, "objects")?;
+        sync_alternates_file(&store_path, &object_dir)?;
+        sync_exclude_file(root, &store_path)?;
+        return Ok(environment);
+    }
+
     let object_format = repository_object_format(root);
     if !store_path.join("HEAD").is_file() {
         let store = store_path.to_str().ok_or(AppError::InvalidPath)?;
@@ -45,18 +60,8 @@ pub(super) fn app_environment(root: &Path) -> AppResult<Vec<(OsString, OsString)
         run_git(root, &args)?;
     }
 
-    let environment = vec![
-        (OsString::from("GIT_DIR"), store_path.as_os_str().to_owned()),
-        (OsString::from("GIT_WORK_TREE"), root.as_os_str().to_owned()),
-    ];
-
     let object_dir = git_path(root, "objects")?;
-    let alternate_file = store_path.join("objects/info/alternates");
-    let alternate = format!("{}\n", object_dir.display());
-    let current_alternate = fs::read_to_string(&alternate_file).ok();
-    if current_alternate.as_deref() != Some(alternate.as_str()) {
-        fs::write(&alternate_file, alternate).map_err(map_storage_io)?;
-    }
+    sync_alternates_file(&store_path, &object_dir)?;
     sync_exclude_file(root, &store_path)?;
 
     let bare_config = output(root, &["config", "--bool", "core.bare"], &environment)?;
@@ -75,6 +80,16 @@ pub(super) fn app_environment(root: &Path) -> AppResult<Vec<(OsString, OsString)
 
     migrate_legacy_references(root, &store_path, &environment)?;
     Ok(environment)
+}
+
+fn sync_alternates_file(store_path: &Path, object_dir: &Path) -> AppResult<()> {
+    let alternate_file = store_path.join("objects/info/alternates");
+    let alternate = format!("{}\n", object_dir.display());
+    let current_alternate = fs::read_to_string(&alternate_file).ok();
+    if current_alternate.as_deref() != Some(alternate.as_str()) {
+        fs::write(&alternate_file, alternate).map_err(map_storage_io)?;
+    }
+    Ok(())
 }
 
 fn repository_object_format(root: &Path) -> String {
@@ -214,19 +229,30 @@ pub(super) fn checkpoint_reference_ids(root: &Path) -> AppResult<HashSet<String>
 }
 
 pub(super) fn checkpoint_commit(root: &Path, id: &str) -> AppResult<Option<String>> {
+    let environment = if id.starts_with("git-") {
+        Vec::new()
+    } else {
+        app_environment(root)?
+    };
+    checkpoint_commit_with_env(root, id, &environment)
+}
+
+pub(super) fn checkpoint_commit_with_env(
+    root: &Path,
+    id: &str,
+    environment: &[(OsString, OsString)],
+) -> AppResult<Option<String>> {
     let reference = if let Some(commit) = id.strip_prefix("git-") {
         format!("{commit}^{{commit}}")
     } else {
-        if !reference_exists(root, id)? {
-            return Ok(None);
-        }
         checkpoint_ref(id)
     };
-    let output = if id.starts_with("git-") {
-        output(root, &["rev-parse", "--verify", &reference], &[])?
+    let environment = if id.starts_with("git-") {
+        &[][..]
     } else {
-        app_output(root, &["rev-parse", "--verify", &reference], &[])?
+        environment
     };
+    let output = output(root, &["rev-parse", "--verify", &reference], environment)?;
     if !output.status.success() {
         return Ok(None);
     }

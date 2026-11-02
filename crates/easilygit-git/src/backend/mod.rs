@@ -76,12 +76,13 @@ impl ProjectPort for SystemGitBackend {
 
     fn current_changes(&self, root: &Path) -> AppResult<Vec<ChangedFile>> {
         let (_, metadata) = self.load_metadata(root)?;
+        let app_env = commands::app_environment(root)?;
         let current_checkpoint_id = metadata
             .current_checkpoint
             .as_deref()
             .filter(|id| !id.starts_with("git-"));
         let mut checkpoint = match current_checkpoint_id {
-            Some(id) => commands::checkpoint_commit(root, id)?,
+            Some(id) => commands::checkpoint_commit_with_env(root, id, &app_env)?,
             None => None,
         };
         if checkpoint.is_none() {
@@ -89,14 +90,16 @@ impl ProjectPort for SystemGitBackend {
                 if saved_checkpoint.kind == CheckpointKind::Git {
                     continue;
                 }
-                if let Some(commit) = commands::checkpoint_commit(root, &saved_checkpoint.id)? {
+                if let Some(commit) =
+                    commands::checkpoint_commit_with_env(root, &saved_checkpoint.id, &app_env)?
+                {
                     checkpoint = Some(commit);
                     break;
                 }
             }
         }
         let base = checkpoint.or_else(|| snapshot::head_commit(root));
-        status::current_changes(root, base.as_deref(), &metadata.excluded_paths)
+        status::current_changes(root, base.as_deref(), &metadata.excluded_paths, &app_env)
     }
 
     fn checkpoints_page(
@@ -129,17 +132,9 @@ impl ProjectPort for SystemGitBackend {
 
     fn current_checkpoint_id(&self, root: &Path) -> AppResult<Option<String>> {
         let (_, metadata) = self.load_metadata(root)?;
-        let Some(id) = metadata
+        Ok(metadata
             .current_checkpoint
-            .filter(|id| !id.starts_with("git-"))
-        else {
-            return Ok(None);
-        };
-        if commands::reference_exists(root, &id)? {
-            Ok(Some(id))
-        } else {
-            Ok(None)
-        }
+            .filter(|id| !id.starts_with("git-")))
     }
 
     fn has_user_checkpoint(&self, root: &Path) -> AppResult<bool> {
