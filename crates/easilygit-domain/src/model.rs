@@ -10,7 +10,18 @@ pub struct ProjectState {
     pub current_changes: Vec<ChangedFile>,
     pub checkpoints: Vec<Checkpoint>,
     pub has_more_checkpoints: bool,
+    pub current_checkpoint_id: Option<String>,
     pub can_undo_restore: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectOverview {
+    pub root: String,
+    pub name: String,
+    pub initialized: bool,
+    pub is_git_repository: bool,
+    pub change_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

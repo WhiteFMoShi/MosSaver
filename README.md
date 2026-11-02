@@ -1,6 +1,10 @@
-# EasilyGit
+# MosSaver
 
-EasilyGit is a small desktop app for people who want safe, easy-to-understand versions of a project without learning Git commands. Choose a folder to view its existing Git history, save an EasilyGit version, and restore that version when you need to go back. Existing Git commits are read-only in EasilyGit; the app keeps branches and the staging area untouched, and watches the selected folder for file changes.
+MosSaver is a simple desktop app for people who want safe, easy-to-understand versions of their project without learning Git commands. Add folders once, then see their current state from one home screen. Save a version and restore it when you need to go back. Existing Git commits are read-only in MosSaver; the app keeps branches and the staging area untouched, and watches managed folders for file changes.
+
+The interface offers two built-in appearances: a light theme inspired by the default VS Code light theme, and a dark theme inspired by One Dark Pro.
+
+MosSaver uses Tauri's native system WebView rather than bundling Chromium. macOS uses WKWebView, Windows uses the installed Evergreen WebView2 runtime, and Linux uses the system WebKitGTK runtime. The Windows installer uses the small WebView2 bootstrapper by default; it downloads the runtime only when the computer does not already have it. A fixed WebView2 runtime is intentionally not embedded, so MosSaver does not add a roughly 180 MB browser runtime to the installer.
 
 ## Run locally
 
@@ -12,7 +16,7 @@ npm install
 npm run tauri dev
 ```
 
-On macOS, install the Xcode command line tools first. On Windows, install the Visual Studio C++ Build Tools and WebView2. On Ubuntu, install the Tauri/WebKit development packages described in the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
+On macOS, install the Xcode command line tools first. On Windows, install the Visual Studio C++ Build Tools and WebView2 for development. On Ubuntu, install the Tauri/WebKit development packages described in the [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/).
 
 ## Verify changes
 

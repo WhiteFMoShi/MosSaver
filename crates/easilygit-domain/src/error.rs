@@ -14,7 +14,7 @@ pub enum AppError {
     NotInitialized,
     #[error("The requested checkpoint could not be found.")]
     CheckpointNotFound,
-    #[error("Git history entries can be viewed but not restored by EasilyGit.")]
+    #[error("Git history entries can be viewed but not restored by MosSaver.")]
     CheckpointReadOnly,
     #[error("There is no restore operation to undo.")]
     NothingToUndo,
@@ -24,7 +24,7 @@ pub enum AppError {
     PermissionDenied,
     #[error("The restore could not be completed safely: {0}")]
     RestoreFailed(String),
-    #[error("Could not read or write EasilyGit metadata: {0}")]
+    #[error("Could not read or write MosSaver metadata: {0}")]
     Metadata(String),
     #[error("Git operation failed: {0}")]
     Git(String),

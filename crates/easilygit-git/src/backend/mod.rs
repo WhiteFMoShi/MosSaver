@@ -76,25 +76,24 @@ impl ProjectPort for SystemGitBackend {
 
     fn current_changes(&self, root: &Path) -> AppResult<Vec<ChangedFile>> {
         let (_, metadata) = self.load_metadata(root)?;
-        let mut checkpoint = match metadata.current_checkpoint {
-            Some(id) => commands::checkpoint_commit(root, &id)?,
-            _ => None,
+        let current_checkpoint_id = metadata
+            .current_checkpoint
+            .as_deref()
+            .filter(|id| !id.starts_with("git-"));
+        let mut checkpoint = match current_checkpoint_id {
+            Some(id) => commands::checkpoint_commit(root, id)?,
+            None => None,
         };
         if checkpoint.is_none() {
-            let mut checkpoints = Vec::new();
-            for checkpoint in metadata.checkpoints {
-                if let Some(commit) = commands::checkpoint_commit(root, &checkpoint.id)? {
-                    checkpoints.push((checkpoint, commit));
+            for saved_checkpoint in metadata.checkpoints.iter().rev() {
+                if saved_checkpoint.kind == CheckpointKind::Git {
+                    continue;
+                }
+                if let Some(commit) = commands::checkpoint_commit(root, &saved_checkpoint.id)? {
+                    checkpoint = Some(commit);
+                    break;
                 }
             }
-            checkpoint = checkpoints
-                .iter()
-                .max_by(|(left, _), (right, _)| {
-                    left.created_at
-                        .cmp(&right.created_at)
-                        .then_with(|| left.id.cmp(&right.id))
-                })
-                .map(|(_, commit)| commit.clone());
         }
         let base = checkpoint.or_else(|| snapshot::head_commit(root));
         status::current_changes(root, base.as_deref(), &metadata.excluded_paths)
@@ -126,6 +125,21 @@ impl ProjectPort for SystemGitBackend {
             checkpoints: visible.into_iter().skip(offset).take(limit).collect(),
             has_more,
         })
+    }
+
+    fn current_checkpoint_id(&self, root: &Path) -> AppResult<Option<String>> {
+        let (_, metadata) = self.load_metadata(root)?;
+        let Some(id) = metadata
+            .current_checkpoint
+            .filter(|id| !id.starts_with("git-"))
+        else {
+            return Ok(None);
+        };
+        if commands::reference_exists(root, &id)? {
+            Ok(Some(id))
+        } else {
+            Ok(None)
+        }
     }
 
     fn has_user_checkpoint(&self, root: &Path) -> AppResult<bool> {

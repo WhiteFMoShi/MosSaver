@@ -2,7 +2,7 @@
 name = "easilygit-desktop"
 version.workspace = true
 description = "Simple local version history for AI-assisted projects"
-authors = ["EasilyGit"]
+authors = ["MosSaver contributors"]
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -24,6 +24,8 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 notify = "8"
 serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 easilygit-app = { path = "../../../crates/easilygit-app" }
 easilygit-domain = { path = "../../../crates/easilygit-domain" }
 easilygit-git = { path = "../../../crates/easilygit-git" }

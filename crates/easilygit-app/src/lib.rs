@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use easilygit_domain::{
-    AppError, AppResult, ChangedFile, Checkpoint, CheckpointPage, ManagedFile, ProjectState,
+    AppError, AppResult, ChangedFile, Checkpoint, CheckpointPage, ManagedFile, ProjectOverview,
+    ProjectState,
 };
 
 const CHECKPOINT_PAGE_SIZE: usize = 50;
@@ -17,6 +18,7 @@ pub trait ProjectPort: Send + Sync + 'static {
         offset: usize,
         limit: usize,
     ) -> AppResult<CheckpointPage>;
+    fn current_checkpoint_id(&self, root: &Path) -> AppResult<Option<String>>;
     fn has_user_checkpoint(&self, root: &Path) -> AppResult<bool>;
     fn create_checkpoint(&self, root: &Path, label: &str, automatic: bool)
     -> AppResult<Checkpoint>;
@@ -44,6 +46,35 @@ impl<P: ProjectPort> ProjectService<P> {
         self.state_for_root(root)
     }
 
+    pub fn project_overview(&self, path: &Path) -> AppResult<ProjectOverview> {
+        let selected = validate_folder(path)?;
+        let repository_root = self.port.repository_root(&selected)?;
+        let initialized = match &repository_root {
+            Some(root) => self.port.is_protected(root)?,
+            None => false,
+        };
+        let is_git_repository = repository_root.is_some();
+        let root = repository_root.unwrap_or(selected);
+        let name = root
+            .file_name()
+            .map(|part| part.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| root.to_string_lossy().into_owned());
+        let change_count = if initialized {
+            self.port.current_changes(&root)?.len()
+        } else {
+            0
+        };
+
+        Ok(ProjectOverview {
+            root: root.to_string_lossy().into_owned(),
+            name,
+            initialized,
+            is_git_repository,
+            change_count,
+        })
+    }
+
     pub fn enable_protection(&self, path: &Path) -> AppResult<ProjectState> {
         let selected = validate_folder(path)?;
         if self.port.repository_root(&selected)?.is_none() {
@@ -55,7 +86,7 @@ impl<P: ProjectPort> ProjectService<P> {
             .ok_or(AppError::NotARepository)?;
         if !self.port.has_user_checkpoint(&root)? {
             self.port
-                .create_checkpoint(&root, "开始使用 EasilyGit", false)?;
+                .create_checkpoint(&root, "开始使用 MosSaver", false)?;
         }
         self.state_for_root(root)
     }
@@ -146,11 +177,13 @@ impl<P: ProjectPort> ProjectService<P> {
                 current_changes: Vec::new(),
                 checkpoints: Vec::new(),
                 has_more_checkpoints: false,
+                current_checkpoint_id: None,
                 can_undo_restore: false,
             });
         }
 
         let page = self.port.checkpoints_page(&root, 0, CHECKPOINT_PAGE_SIZE)?;
+        let current_checkpoint_id = self.port.current_checkpoint_id(&root)?;
 
         Ok(ProjectState {
             root: root.to_string_lossy().into_owned(),
@@ -160,6 +193,7 @@ impl<P: ProjectPort> ProjectService<P> {
             current_changes: self.port.current_changes(&root)?,
             checkpoints: page.checkpoints,
             has_more_checkpoints: page.has_more,
+            current_checkpoint_id,
             can_undo_restore: self.port.can_undo_restore(&root)?,
         })
     }

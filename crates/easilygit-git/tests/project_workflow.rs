@@ -53,6 +53,9 @@ fn save_restore_and_undo_follow_the_saved_version() {
     assert!(initial.initialized);
     assert_eq!(initial.checkpoints.len(), 1);
     assert!(initial.current_changes.is_empty());
+    let overview = service.project_overview(root).unwrap();
+    assert!(overview.initialized);
+    assert_eq!(overview.change_count, 0);
     let initial_id = initial
         .checkpoints
         .iter()
@@ -60,6 +63,10 @@ fn save_restore_and_undo_follow_the_saved_version() {
         .unwrap()
         .id
         .clone();
+    assert_eq!(
+        initial.current_checkpoint_id.as_deref(),
+        Some(initial_id.as_str())
+    );
 
     fs::write(root.join("notes.txt"), "edited after initial\n").unwrap();
     fs::remove_file(root.join("to-remove.txt")).unwrap();
@@ -68,6 +75,8 @@ fn save_restore_and_undo_follow_the_saved_version() {
 
     let changed = service.refresh(root).unwrap();
     assert_eq!(changed.current_changes.len(), 3);
+    let overview = service.project_overview(root).unwrap();
+    assert_eq!(overview.change_count, 3);
     assert!(
         changed
             .current_changes
@@ -96,6 +105,17 @@ fn save_restore_and_undo_follow_the_saved_version() {
     let saved = service.save_version(root, "second version").unwrap();
     assert!(saved.current_changes.is_empty());
     assert_eq!(saved.checkpoints.len(), 2);
+    let saved_id = saved
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.label == "second version")
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        saved.current_checkpoint_id.as_deref(),
+        Some(saved_id.as_str())
+    );
 
     fs::write(root.join("notes.txt"), "later work\n").unwrap();
     fs::write(root.join("later.txt"), "another file\n").unwrap();
@@ -105,6 +125,10 @@ fn save_restore_and_undo_follow_the_saved_version() {
     let restored = service.restore(root, &initial_id).unwrap();
     assert!(restored.current_changes.is_empty());
     assert!(restored.can_undo_restore);
+    assert_eq!(
+        restored.current_checkpoint_id.as_deref(),
+        Some(initial_id.as_str())
+    );
     assert_eq!(
         fs::read_to_string(root.join("notes.txt")).unwrap(),
         "first version\n"
@@ -161,6 +185,10 @@ fn an_existing_git_repository_requires_an_explicit_start() {
     let opened = service.open_project(root).unwrap();
     assert!(!opened.initialized);
     assert!(opened.is_git_repository);
+    let overview = service.project_overview(root).unwrap();
+    assert!(!overview.initialized);
+    assert!(overview.is_git_repository);
+    assert_eq!(overview.change_count, 0);
     let enabled = service.enable_protection(root).unwrap();
     assert!(enabled.initialized);
     assert_eq!(enabled.checkpoints.len(), 1);
@@ -263,7 +291,7 @@ fn using_an_existing_repository_preserves_head_branch_and_git_index() {
     let initial_checkpoint = enabled
         .checkpoints
         .iter()
-        .find(|checkpoint| checkpoint.label == "开始使用 EasilyGit")
+        .find(|checkpoint| checkpoint.label == "开始使用 MosSaver")
         .unwrap()
         .id
         .clone();
@@ -290,6 +318,80 @@ fn using_an_existing_repository_preserves_head_branch_and_git_index() {
     assert_eq!(git(root, &["rev-parse", "HEAD"]), head_before);
     assert_eq!(git(root, &["symbolic-ref", "HEAD"]), branch_before);
     assert!(restored.can_undo_restore);
+}
+
+#[test]
+fn native_git_reset_stays_a_change_against_the_latest_mossaver_version() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "project initial version\n").unwrap();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.name", "Existing Git User"]);
+    git(root, &["config", "user.email", "existing@example.test"]);
+    git(root, &["add", "notes.txt"]);
+    git(
+        root,
+        &["commit", "--quiet", "-m", "Project initial version"],
+    );
+    let initial_git_commit = String::from_utf8(git(root, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+
+    let service = ProjectService::new(SystemGitBackend);
+    service.enable_protection(root).unwrap();
+    fs::write(root.join("notes.txt"), "latest MosSaver version\n").unwrap();
+    let saved = service
+        .save_version(root, "Latest MosSaver version")
+        .unwrap();
+    assert!(saved.current_changes.is_empty());
+    let saved_checkpoint_id = saved
+        .checkpoints
+        .iter()
+        .find(|checkpoint| checkpoint.label == "Latest MosSaver version")
+        .unwrap()
+        .id
+        .clone();
+
+    // Older builds could store the native HEAD in this field after a Git
+    // history refresh. Keep that stale value to verify both overview and full
+    // refresh recover the MosSaver comparison point.
+    let metadata_path = root.join(".git/easilygit/metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    let checkpoints = metadata["checkpoints"].as_array_mut().unwrap();
+    let initial_mossaver_checkpoint = checkpoints
+        .iter_mut()
+        .find(|checkpoint| checkpoint["label"] == "开始使用 MosSaver")
+        .unwrap();
+    // A wall-clock timestamp must not make an older MosSaver version appear
+    // newer than the one most recently saved.
+    initial_mossaver_checkpoint["created_at"] =
+        serde_json::Value::String("9999-12-31T23:59:59+00:00".into());
+    let latest_mossaver_checkpoint = checkpoints
+        .iter_mut()
+        .find(|checkpoint| checkpoint["label"] == "Latest MosSaver version")
+        .unwrap();
+    latest_mossaver_checkpoint["created_at"] =
+        serde_json::Value::String("2000-01-01T00:00:00+00:00".into());
+    metadata["current_checkpoint"] = serde_json::Value::String(format!("git-{initial_git_commit}"));
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    git(root, &["reset", "--hard", &initial_git_commit]);
+    assert_eq!(service.project_overview(root).unwrap().change_count, 1);
+
+    let refreshed = service.refresh(root).unwrap();
+    assert_eq!(refreshed.current_changes.len(), 1);
+    assert_eq!(refreshed.current_changes[0].path, "notes.txt");
+    assert_eq!(refreshed.current_changes[0].kind, ChangeKind::Modified);
+
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    assert_eq!(persisted["current_checkpoint"], saved_checkpoint_id);
 }
 
 #[test]
@@ -380,11 +482,15 @@ fn existing_branch_history_is_read_only_and_never_checks_out_a_branch() {
     assert!(refreshed_labels.contains(&"Alternate branch commit"));
     assert!(refreshed_labels.contains(&"Main branch commit"));
     assert!(refreshed_labels.contains(&"Git commit after enabling"));
-    assert!(refreshed.current_changes.is_empty());
+    assert_eq!(refreshed.current_changes.len(), 1);
+    assert_eq!(refreshed.current_changes[0].path, "later.txt");
+    assert_eq!(refreshed.current_changes[0].kind, ChangeKind::Added);
 
     git(root, &["checkout", "--quiet", "alternate"]);
     let switched = service.refresh(root).unwrap();
-    assert!(switched.current_changes.is_empty());
+    assert_eq!(switched.current_changes.len(), 1);
+    assert_eq!(switched.current_changes[0].path, "notes.txt");
+    assert_eq!(switched.current_changes[0].kind, ChangeKind::Modified);
     assert_eq!(
         String::from_utf8(git(root, &["symbolic-ref", "--short", "HEAD"]))
             .unwrap()

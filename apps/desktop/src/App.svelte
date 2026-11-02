@@ -5,6 +5,7 @@
   import { onMount } from "svelte";
 
   type ChangeKind = "added" | "modified" | "deleted";
+  type Theme = "light" | "dark";
 
   interface ChangedFile {
     path: string;
@@ -36,39 +37,67 @@
     currentChanges: ChangedFile[];
     checkpoints: Checkpoint[];
     hasMoreCheckpoints: boolean;
+    currentCheckpointId: string | null;
     canUndoRestore: boolean;
   }
 
+  interface ProjectOverview {
+    root: string;
+    name: string;
+    initialized: boolean;
+    isGitRepository: boolean;
+    changeCount: number;
+  }
+
   let project = $state<ProjectState | null>(null);
+  let managedPaths = $state<string[]>([]);
+  let folderOverviews = $state<Record<string, ProjectOverview>>({});
+  let folderErrors = $state<Record<string, string>>({});
   let loading = $state(false);
+  let refreshingFolders = $state(false);
   let errorMessage = $state("");
   let selectedCheckpoint = $state<Checkpoint | null>(null);
   let dialogMode = $state<"restore" | "undo" | null>(null);
   let managedFilesOpen = $state(false);
   let managedFiles = $state<ManagedFile[]>([]);
   let stopProtectionOpen = $state(false);
+  let theme = $state<Theme>("light");
   let loadedCheckpointCount = 0;
   let autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingRefreshRoot: string | undefined;
+  const overviewTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   onMount(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    const storedTheme = localStorage.getItem("mossaver-theme");
+    applyTheme(storedTheme === "dark" ? "dark" : "light", false);
 
     listen<string>("project-files-changed", (event) => {
       scheduleProjectRefresh(event.payload);
+      scheduleOverviewRefresh(event.payload);
     })
       .then((stopListening) => {
         if (disposed) stopListening();
         else unlisten = stopListening;
       })
       .catch(() => {
-        errorMessage = "自动刷新暂不可用，你仍可以点击“刷新”查看最新状态。";
+        errorMessage = "自动同步暂不可用，你仍可以点击“刷新”查看最新状态。";
       });
+
+    const refreshOnFocus = () => {
+      if (project?.initialized && !loading) void refreshProject();
+      void refreshAllFolderOverviews();
+    };
+    window.addEventListener("focus", refreshOnFocus);
+    void loadManagedFolders();
 
     return () => {
       disposed = true;
+      window.removeEventListener("focus", refreshOnFocus);
       if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+      for (const timer of overviewTimers.values()) clearTimeout(timer);
+      overviewTimers.clear();
       unlisten?.();
       void invoke("stop_project_watch").catch(() => {});
     };
@@ -88,14 +117,103 @@
       deleted: changes.filter((file) => file.kind === "deleted").length,
     };
   });
+  const changedFolderCount = $derived(
+    managedPaths.filter((path) => (folderOverviews[path]?.changeCount ?? 0) > 0).length,
+  );
+  const inaccessibleFolderCount = $derived(
+    managedPaths.filter((path) => Boolean(folderErrors[path])).length,
+  );
+  const currentCheckpointVisible = $derived.by(() => {
+    const currentProject = project;
+    if (!currentProject?.currentCheckpointId) return false;
+    return currentProject.checkpoints.some((checkpoint) => checkpoint.id === currentProject.currentCheckpointId);
+  });
+  const showCurrentFilesNode = $derived(
+    Boolean(project && (project.currentChanges.length > 0 || !currentCheckpointVisible)),
+  );
+
+  function applyTheme(nextTheme: Theme, persist = true) {
+    theme = nextTheme;
+    document.documentElement.dataset.theme = nextTheme;
+    if (persist) localStorage.setItem("mossaver-theme", nextTheme);
+  }
+
+  async function loadManagedFolders() {
+    try {
+      managedPaths = await invoke<string[]>("list_managed_projects");
+      await syncProjectWatcher();
+      await refreshAllFolderOverviews();
+    } catch (error) {
+      errorMessage = friendlyError(error);
+    }
+  }
+
+  async function syncProjectWatcher() {
+    try {
+      await invoke("watch_projects", { paths: managedPaths });
+    } catch (error) {
+      errorMessage = typeof error === "string" ? error : "文件变化自动同步暂不可用。";
+    }
+  }
+
+  async function refreshAllFolderOverviews() {
+    if (managedPaths.length === 0 || refreshingFolders) return;
+    refreshingFolders = true;
+    try {
+      for (let index = 0; index < managedPaths.length; index += 3) {
+        const batch = managedPaths.slice(index, index + 3);
+        await Promise.all(batch.map((path) => refreshFolderOverview(path)));
+      }
+    } finally {
+      refreshingFolders = false;
+    }
+  }
+
+  async function refreshFolderOverview(path: string) {
+    try {
+      const overview = await invoke<ProjectOverview>("project_overview", { path });
+      folderOverviews = { ...folderOverviews, [path]: overview };
+      const { [path]: _removed, ...remainingErrors } = folderErrors;
+      folderErrors = remainingErrors;
+    } catch (error) {
+      folderErrors = { ...folderErrors, [path]: friendlyError(error) };
+    }
+  }
+
+  function updateFolderOverviewFromProject(state: ProjectState) {
+    folderOverviews = {
+      ...folderOverviews,
+      [state.root]: {
+        root: state.root,
+        name: state.name,
+        initialized: state.initialized,
+        isGitRepository: state.isGitRepository,
+        changeCount: state.currentChanges.length,
+      },
+    };
+    const { [state.root]: _removed, ...remainingErrors } = folderErrors;
+    folderErrors = remainingErrors;
+  }
+
+  function scheduleOverviewRefresh(path: string) {
+    if (!managedPaths.includes(path)) return;
+    const existing = overviewTimers.get(path);
+    if (existing) clearTimeout(existing);
+    overviewTimers.set(path, setTimeout(() => {
+      overviewTimers.delete(path);
+      if (project?.root === path && project.initialized) {
+        updateFolderOverviewFromProject(project);
+      } else {
+        void refreshFolderOverview(path);
+      }
+    }, 450));
+  }
 
   async function chooseFolder() {
     errorMessage = "";
     try {
-      const selection = await open({ directory: true, multiple: false, title: "选择要保护的文件夹" });
-      if (typeof selection === "string") {
-        await openProject(selection);
-      }
+      const selection = await open({ directory: true, multiple: false, title: "添加要保护的文件夹" });
+      if (typeof selection === "string") await openProject(selection);
     } catch (error) {
       errorMessage = friendlyError(error);
     }
@@ -110,11 +228,15 @@
       managedFilesOpen = false;
       stopProtectionOpen = false;
       if (opened.initialized) {
-        await invoke("watch_project", { path: opened.root });
-      } else {
-        await invoke("stop_project_watch");
+        await registerManagedFolder(opened.root);
+        updateFolderOverviewFromProject(opened);
       }
     });
+  }
+
+  async function registerManagedFolder(path: string) {
+    managedPaths = await invoke<string[]>("add_managed_project", { path });
+    await syncProjectWatcher();
   }
 
   async function initializeProject() {
@@ -122,7 +244,8 @@
     await perform(async () => {
       const initialized = await invoke<ProjectState>("initialize_project", { path: project!.root });
       await adoptProjectState(initialized, 0);
-      await invoke("watch_project", { path: initialized.root });
+      await registerManagedFolder(initialized.root);
+      updateFolderOverviewFromProject(initialized);
     });
   }
 
@@ -132,6 +255,7 @@
     await perform(async () => {
       const refreshed = await invoke<ProjectState>("refresh_project", { path: project!.root });
       await adoptProjectState(refreshed, previousCount);
+      updateFolderOverviewFromProject(refreshed);
     });
   }
 
@@ -143,6 +267,7 @@
         label: "手动保存的版本",
       });
       await adoptProjectState(saved, loadedCheckpointCount);
+      updateFolderOverviewFromProject(saved);
     });
   }
 
@@ -155,6 +280,7 @@
         checkpointId: checkpoint.id,
       });
       await adoptProjectState(restored, loadedCheckpointCount);
+      updateFolderOverviewFromProject(restored);
       selectedCheckpoint = null;
       dialogMode = null;
     });
@@ -165,7 +291,35 @@
     await perform(async () => {
       const restored = await invoke<ProjectState>("undo_restore", { path: project!.root });
       await adoptProjectState(restored, loadedCheckpointCount);
+      updateFolderOverviewFromProject(restored);
       dialogMode = null;
+    });
+  }
+
+  async function removeManagedFolder(path: string) {
+    await perform(async () => {
+      managedPaths = await invoke<string[]>("remove_managed_project", { path });
+      const { [path]: _overview, ...remainingOverviews } = folderOverviews;
+      const { [path]: _error, ...remainingErrors } = folderErrors;
+      folderOverviews = remainingOverviews;
+      folderErrors = remainingErrors;
+      await syncProjectWatcher();
+    });
+  }
+
+  async function stopProtection() {
+    if (!project) return;
+    const root = project.root;
+    await perform(async () => {
+      await invoke<ProjectState>("disable_protection", { path: root });
+      managedPaths = await invoke<string[]>("remove_managed_project", { path: root });
+      const { [root]: _overview, ...remainingOverviews } = folderOverviews;
+      folderOverviews = remainingOverviews;
+      await syncProjectWatcher();
+      managedFilesOpen = false;
+      stopProtectionOpen = false;
+      project = null;
+      loadedCheckpointCount = 0;
     });
   }
 
@@ -177,8 +331,6 @@
     managedFilesOpen = false;
     stopProtectionOpen = false;
     loadedCheckpointCount = 0;
-    pendingRefreshRoot = undefined;
-    void invoke("stop_project_watch").catch(() => {});
   }
 
   async function adoptProjectState(next: ProjectState, preserveCheckpointCount: number) {
@@ -230,19 +382,8 @@
         managed: !file.managed,
       });
       await adoptProjectState(updated, loadedCheckpointCount);
+      updateFolderOverviewFromProject(updated);
       managedFiles = await invoke<ManagedFile[]>("list_managed_files", { path: project!.root });
-    });
-  }
-
-  async function stopProtection() {
-    if (!project) return;
-    const root = project.root;
-    await perform(async () => {
-      const stopped = await invoke<ProjectState>("disable_protection", { path: root });
-      await adoptProjectState(stopped, 0);
-      managedFilesOpen = false;
-      stopProtectionOpen = false;
-      await invoke("stop_project_watch").catch(() => {});
     });
   }
 
@@ -255,12 +396,9 @@
     if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
     autoRefreshTimer = setTimeout(() => {
       autoRefreshTimer = undefined;
-      if (loading) {
-        pendingRefreshRoot = root;
-      } else if (project?.initialized && project.root === root) {
-        void refreshProject();
-      }
-    }, 200);
+      if (loading) pendingRefreshRoot = root;
+      else if (project?.initialized && project.root === root) void refreshProject();
+    }, 250);
   }
 
   function requestUndoRestore() {
@@ -294,12 +432,12 @@
         NOT_A_REPOSITORY: "这个文件夹暂时无法开启版本保护。",
         NOT_INITIALIZED: "请先为这个文件夹开启版本保护。",
         CHECKPOINT_NOT_FOUND: "找不到这个版本，它可能已经被移除。",
-        CHECKPOINT_READ_ONLY: "这是原有 Git 提交，只能查看，不能通过 EasilyGit 恢复。",
+        CHECKPOINT_READ_ONLY: "这是原有 Git 提交，只能查看，不能通过 MosSaver 恢复。",
         NOTHING_TO_UNDO: "现在没有可以撤销的恢复操作。",
         INVALID_PATH: "项目中有一个文件名无法安全处理。",
         PERMISSION_DENIED: "没有权限访问项目文件，请检查文件夹权限。",
         RESTORE_FAILED: "恢复没有完成。请刷新项目状态后再试。",
-        METADATA_ERROR: "EasilyGit 的版本记录暂时无法读写，请检查文件夹权限。",
+        METADATA_ERROR: "MosSaver 的版本记录暂时无法读写，请检查文件夹权限。",
         GIT_ERROR: "保存项目时遇到问题，请检查 Git 和项目文件后重试。",
         INTERNAL_ERROR: "操作没有完成，请重试。",
       };
@@ -307,6 +445,17 @@
     }
     if (typeof error === "string") return error;
     return "操作没有完成，请重试。";
+  }
+
+  function folderStatus(path: string): { label: string; tone: string; detail: string } {
+    const overview = folderOverviews[path];
+    if (folderErrors[path]) return { label: "无法访问", tone: "danger", detail: folderErrors[path] };
+    if (!overview) return { label: "正在读取", tone: "pending", detail: "正在检查文件夹状态" };
+    if (!overview.initialized) return { label: "保护已停止", tone: "muted", detail: "打开文件夹可重新开启保护" };
+    if (overview.changeCount > 0) {
+      return { label: `${overview.changeCount} 项变化`, tone: "changed", detail: "尚未保存到新版本" };
+    }
+    return { label: "一切正常", tone: "saved", detail: "与最近保存的版本一致" };
   }
 
   function formatTime(value: string): string {
@@ -321,130 +470,169 @@
     }).format(date);
   }
 
+  function checkpointLabel(checkpoint: Checkpoint): string {
+    return checkpoint.label === "开始使用 EasilyGit" ? "开始使用 MosSaver" : checkpoint.label;
+  }
+
   function fileName(path: string): string {
     return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
   }
 </script>
 
 <svelte:head>
-  <title>{project ? `${project.name} · EasilyGit` : "EasilyGit · 轻松保存每一步"}</title>
+  <title>{project ? `${project.name} · MosSaver` : "MosSaver · 轻松保存每一步"}</title>
 </svelte:head>
 
 <main class="app-shell">
   <header class="topbar">
-    <a class="brand" href="/" aria-label="EasilyGit 首页" onclick={(event) => { event.preventDefault(); returnHome(); }}>
+    <button class="brand" aria-label="MosSaver 首页" onclick={returnHome}>
       <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
-      <span>Easily<span class="brand-light">Git</span></span>
-    </a>
-    {#if project}
-      <button class="button button-quiet topbar-folder" onclick={chooseFolder} disabled={loading}>
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.8 5.4a1.6 1.6 0 0 1 1.6-1.6h4l1.5 1.7h5.7a1.6 1.6 0 0 1 1.6 1.6v7.5a1.6 1.6 0 0 1-1.6 1.6H4.4a1.6 1.6 0 0 1-1.6-1.6V5.4Z" /></svg>
-        打开其他文件夹
-      </button>
-    {/if}
+      <span>MosSaver</span>
+    </button>
+    <div class="topbar-actions">
+      {#if project}
+        <button class="button button-subtle back-button" onclick={returnHome} disabled={loading}>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m12.5 4.5-5.5 5.5 5.5 5.5" /></svg>
+          我的文件夹
+        </button>
+      {:else}
+        <button class="button button-primary add-button" onclick={chooseFolder} disabled={loading}>
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>
+          添加文件夹
+        </button>
+      {/if}
+      <div class="theme-switch" role="group" aria-label="选择外观">
+        <button class:active={theme === "light"} aria-pressed={theme === "light"} onclick={() => applyTheme("light")} title="浅色主题">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="3.3" /><path d="M10 2.3v1.6m0 12.2v1.6M2.3 10h1.6m12.2 0h1.6M4.55 4.55l1.1 1.1m8.7 8.7 1.1 1.1m0-10.9-1.1 1.1m-8.7 8.7-1.1 1.1" /></svg>
+          <span>浅色</span>
+        </button>
+        <button class:active={theme === "dark"} aria-pressed={theme === "dark"} onclick={() => applyTheme("dark")} title="深色主题">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M16.5 12.4A7 7 0 0 1 7.6 3.5 7.1 7.1 0 1 0 16.5 12.4Z" /></svg>
+          <span>深色</span>
+        </button>
+      </div>
+    </div>
   </header>
 
+  {#if errorMessage}
+    <div class="error-banner" role="alert">
+      <span class="error-icon">!</span>
+      <span>{errorMessage}</span>
+      <button class="error-dismiss" onclick={() => errorMessage = ""} aria-label="关闭提示">×</button>
+    </div>
+  {/if}
+
   {#if !project}
-    <section class="welcome-view">
-      <div class="welcome-art" aria-hidden="true">
-        <div class="art-orbit orbit-one"></div>
-        <div class="art-orbit orbit-two"></div>
-        <div class="art-card art-card-back"><span class="art-line short"></span><span class="art-line"></span><span class="art-line medium"></span></div>
-        <div class="art-card art-card-front">
-          <span class="art-dot"></span><span class="art-line short"></span><span class="art-line"></span><span class="art-line medium"></span>
-          <span class="art-check">✓</span>
+    <section class="home-view">
+      <div class="home-heading">
+        <div>
+          <p class="eyebrow">你的工作空间</p>
+          <h1>我的文件夹</h1>
+          <p class="home-subtitle">在这里查看项目变化，需要时一键保存或回到之前的版本。</p>
         </div>
-        <span class="art-spark spark-one">✳</span><span class="art-spark spark-two">✦</span>
+        {#if managedPaths.length > 0}
+          <div class="folder-total"><strong>{managedPaths.length}</strong><span>个文件夹</span></div>
+        {/if}
       </div>
-      <p class="eyebrow">给每一次 AI 创作，一份安心</p>
-      <h1>放心尝试，<span>随时回到之前。</span></h1>
-      <p class="welcome-copy">把你的项目交给 EasilyGit。每次重要修改，<br class="desktop-break" />都可以轻松保存，也能随时恢复。</p>
-      <button class="button button-primary button-large" onclick={chooseFolder} disabled={loading}>
-        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M2.8 5.4a1.6 1.6 0 0 1 1.6-1.6h4l1.5 1.7h5.7a1.6 1.6 0 0 1 1.6 1.6v7.5a1.6 1.6 0 0 1-1.6 1.6H4.4a1.6 1.6 0 0 1-1.6-1.6V5.4Z" /></svg>
-        选择一个项目文件夹
-      </button>
-      <p class="privacy-note"><span class="privacy-dot"></span>你的文件和版本记录都保存在这台电脑上</p>
+
+      {#if managedPaths.length === 0}
+        <section class="empty-home">
+          <div class="empty-folder-icon" aria-hidden="true">
+            <svg viewBox="0 0 48 48"><path d="M6 13.5A3.5 3.5 0 0 1 9.5 10h9l4 4h16A3.5 3.5 0 0 1 42 17.5v17a3.5 3.5 0 0 1-3.5 3.5h-29A3.5 3.5 0 0 1 6 34.5v-21Z" /><path d="M6.5 19h35" /></svg>
+          </div>
+          <h2>还没有添加文件夹</h2>
+          <p>选择一个项目文件夹，MosSaver 就会帮你记录变化。</p>
+          <button class="button button-primary button-large" onclick={chooseFolder} disabled={loading}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg>
+            添加第一个文件夹
+          </button>
+          <span class="privacy-note"><span class="privacy-dot"></span>你的文件和版本都只保存在这台电脑上</span>
+        </section>
+      {:else}
+        <div class="folder-grid">
+          {#each managedPaths as path (path)}
+            {@const state = folderStatus(path)}
+            {@const overview = folderOverviews[path]}
+            <article class="folder-card">
+              <button class="folder-card-open" onclick={() => openProject(path)} disabled={loading}>
+                <span class="folder-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24"><path d="M3 6.5A2.5 2.5 0 0 1 5.5 4h5l2.5 2.5h5A2.5 2.5 0 0 1 20.5 9v8.5a2.5 2.5 0 0 1-2.5 2.5H5.5A2.5 2.5 0 0 1 3 17.5v-11Z" /><path d="M3.5 9h17" /></svg>
+                </span>
+                <span class="folder-card-copy">
+                  <span class="folder-name">{overview?.name ?? fileName(path)}</span>
+                  <span class="folder-path" title={path}>{path}</span>
+                </span>
+                <span class="folder-arrow" aria-hidden="true">›</span>
+              </button>
+              <div class="folder-card-footer">
+                <span class="folder-status status-{state.tone}"><span></span>{state.label}</span>
+                <span class="folder-detail">{state.detail}</span>
+                <button class="remove-folder" onclick={() => removeManagedFolder(path)} disabled={loading} aria-label={`从列表移除 ${fileName(path)}`} title="从列表移除">移除</button>
+              </div>
+            </article>
+          {/each}
+        </div>
+        <p class="list-footnote"><span class="privacy-dot"></span>移出列表不会删除文件，也不会关闭该文件夹的版本保护。</p>
+      {/if}
     </section>
   {:else}
     <section class="project-view">
       <div class="project-heading">
         <div class="heading-copy">
-          <div class="breadcrumb"><span>我的项目</span><span class="breadcrumb-slash">/</span><span>{project.name}</span></div>
+          <p class="breadcrumb">我的文件夹 <span>›</span> {project.name}</p>
           <h1>{project.name}</h1>
           <p class="project-path" title={project.root}>{project.root}</p>
         </div>
-        <button class="button button-quiet refresh-button" onclick={refreshProject} disabled={loading} aria-label="刷新项目状态">
-          <svg class:spinning={loading} viewBox="0 0 20 20" aria-hidden="true"><path d="M16.3 8A6.5 6.5 0 0 0 4.9 5.7L3.5 7.1M3.7 4.2v3.2h3.2M3.7 12A6.5 6.5 0 0 0 15.1 14.3l1.4-1.4m-.2 3v-3.2h-3.2" /></svg>
-          刷新
-        </button>
+        {#if project.initialized}
+          <div class="project-heading-actions">
+            {#if project.canUndoRestore}
+              <button class="button button-subtle" onclick={requestUndoRestore} disabled={loading}>撤销恢复</button>
+            {/if}
+            <button class="button button-subtle refresh-button" onclick={refreshProject} disabled={loading} aria-label="刷新文件夹状态">
+              <svg class:spinning={loading} viewBox="0 0 20 20" aria-hidden="true"><path d="M16.3 8A6.5 6.5 0 0 0 4.9 5.7L3.5 7.1M3.7 4.2v3.2h3.2M3.7 12A6.5 6.5 0 0 0 15.1 14.3l1.4-1.4m-.2 3v-3.2h-3.2" /></svg>
+              刷新
+            </button>
+            <button class="button button-primary" onclick={saveVersion} disabled={loading || project.currentChanges.length === 0}>
+              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3.5v9m-3.5-3.5L10 12.5l3.5-3.5M4.5 15.5v1h11v-1" /></svg>
+              保存版本
+            </button>
+          </div>
+        {/if}
       </div>
-
-      {#if errorMessage}
-        <div class="error-banner" role="alert">
-          <span class="error-icon">!</span>
-          <span>{errorMessage}</span>
-          <button class="error-dismiss" onclick={() => errorMessage = ""} aria-label="关闭提示">×</button>
-        </div>
-      {/if}
 
       {#if !project.initialized}
         <section class="setup-card">
-          <div class="setup-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.7 20 8v8l-8 4.3L4 16V8l8-4.3Z" /><path d="m4.4 8.2 7.6 4.1 7.6-4.1M12 12.4v7.4M8 5.9l8 4.3" /></svg></div>
+          <div class="setup-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.7 20 8v8l-8 4.3L4 16V8l8-4.3Z" /><path d="m4.4 8.2 7.6 4.1 7.6-4.1M12 12.4v7.4" /></svg></div>
           <div class="setup-copy">
-            <p class="eyebrow">只需一步</p>
-            <h2>{project.isGitRepository ? "检测到已有 Git 仓库" : "为这个文件夹开启版本保护"}</h2>
+            <p class="eyebrow">简单、安全、本地保存</p>
+            <h2>{project.isGitRepository ? "检测到已有 Git 仓库" : "开启这个文件夹的版本保护"}</h2>
             {#if project.isGitRepository}
-              <p>开启后，可以只读查看已有 Git 提交，并保存项目当前状态。EasilyGit 不会移动分支或改动暂存区；恢复仅适用于 EasilyGit 保存的版本。</p>
+              <p>可以只读查看已有 Git 提交，并保存项目当前状态。MosSaver 不会移动分支或改动暂存区；只有 MosSaver 保存的版本可以恢复。</p>
             {:else}
-              <p>开启后，你可以保存项目当前状态，并在需要时恢复。EasilyGit 会在项目中创建本地 Git 记录，不会上传任何文件。</p>
+              <p>开启后，MosSaver 会在本地记录项目版本。不会上传文件，也不会影响你电脑上的其他文件夹。</p>
             {/if}
+            <div class="setup-actions">
+              <button class="button button-primary" onclick={initializeProject} disabled={loading}>
+                {loading ? "正在准备…" : "开启版本保护"}
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5" /></svg>
+              </button>
+              <button class="button button-subtle" onclick={returnHome} disabled={loading}>返回列表</button>
+            </div>
           </div>
-          <button class="button button-primary" onclick={initializeProject} disabled={loading}>
-            {loading ? "正在准备…" : project.isGitRepository ? "读取 Git 历史并开启保护" : "开启版本保护"}
-            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 10h12m-5-5 5 5-5 5" /></svg>
-          </button>
         </section>
       {:else}
-        <section class="status-card">
-          <div class="status-indicator"><span></span></div>
-          <div class="status-copy">
-            <h2>{project.currentChanges.length === 0 ? "项目已保存" : `有 ${project.currentChanges.length} 项尚未保存`}</h2>
-            <p>{project.currentChanges.length === 0 ? "当前文件与最近保存的版本一致。" : "保存一个版本，记录现在的项目状态。"}</p>
-          </div>
-          <div class="status-actions">
-            {#if project.canUndoRestore}
-              <button class="button button-quiet undo-button" onclick={requestUndoRestore} disabled={loading}>
-                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 6 3.5 9.5 7 13M4 9.5h7a5 5 0 0 1 5 5" /></svg>
-                撤销恢复
-              </button>
-            {/if}
-            <button class="button button-primary" onclick={saveVersion} disabled={loading || project.currentChanges.length === 0}>
-              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 3.5v9m-3.5-3.5L10 12.5l3.5-3.5M4.5 15.5v1h11v-1" /></svg>
-              保存当前版本
-            </button>
-          </div>
-        </section>
-
         <div class="content-grid">
           <section class="panel changes-panel">
             <div class="panel-heading">
-              <div>
-                <h2>当前变化</h2>
-                <p>自上次保存后发生的修改</p>
-              </div>
+              <div><h2>文件变化</h2><p>自上次保存后发生的修改</p></div>
               <div class="panel-heading-actions">
-                {#if project.currentChanges.length > 0}
-                  <span class="count-badge">{project.currentChanges.length}</span>
-                {/if}
+                {#if project.currentChanges.length > 0}<span class="count-badge">{project.currentChanges.length}</span>{/if}
                 <button class="text-button" onclick={openManagedFiles} disabled={loading}>管理文件</button>
               </div>
             </div>
-
             {#if project.currentChanges.length === 0}
-              <div class="empty-changes">
-                <span class="empty-check">✓</span>
-                <p>一切都很平静</p>
-                <span>有新修改时，会显示在这里。</span>
+              <div class="empty-panel">
+                <span class="empty-check">✓</span><strong>暂时没有新的变化</strong><span>有新修改时，会显示在这里。</span>
               </div>
             {:else}
               <ul class="file-list">
@@ -467,28 +655,37 @@
 
           <section class="panel history-panel">
             <div class="panel-heading">
-              <div>
-                <h2>已保存的版本</h2>
-                <p>EasilyGit 版本可恢复；已有 Git 提交只读查看</p>
-              </div>
-              <span class="history-total">已加载 {project.checkpoints.length} 个版本</span>
+              <div><h2>保存记录</h2><p>MosSaver 版本可恢复 · 原有 Git 提交仅查看</p></div>
+              <span class="history-total">{project.checkpoints.length}{project.hasMoreCheckpoints ? "+" : ""} 个</span>
             </div>
-
             {#if project.checkpoints.length === 0}
-              <div class="empty-history">
-                <div class="empty-history-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5h16M6.5 4.5h11v15h-11zM9 11h6m-6 3h4" /></svg></div>
-                <p>还没有保存过版本</p>
-                <span>点击“保存当前版本”，为项目留下一个安全点。</span>
-              </div>
+              <div class="empty-panel"><span class="history-empty-icon">◷</span><strong>还没有保存记录</strong><span>保存当前版本，为项目留下一个安全点。</span></div>
             {:else}
               <ol class="timeline">
-                {#each project.checkpoints as checkpoint, index (checkpoint.id)}
-                  <li class:latest={index === 0} class="timeline-item">
-                    <span class="timeline-marker">{#if index === 0}<span></span>{/if}</span>
+                {#if showCurrentFilesNode}
+                  <li class="timeline-item current-files-item">
+                    <span class="timeline-marker current-files-marker"><span></span></span>
                     <div class="timeline-content">
                       <div class="timeline-title-row">
-                        <h3>{checkpoint.label}</h3>
-                        {#if index === 0}<span class="latest-badge">{checkpoint.label === "开始使用 EasilyGit" ? "保护起点" : "最近"}</span>{/if}
+                        <h3>当前文件</h3>
+                        <span class="latest-badge">当前</span>
+                      </div>
+                      <p class="timeline-time">
+                        {project.currentChanges.length > 0
+                          ? `${project.currentChanges.length} 项尚未保存的变化`
+                          : "当前状态与保存基准一致"}
+                      </p>
+                    </div>
+                  </li>
+                {/if}
+                {#each project.checkpoints as checkpoint (checkpoint.id)}
+                  {@const isCurrentCheckpoint = checkpoint.id === project.currentCheckpointId}
+                  <li class:current-checkpoint={isCurrentCheckpoint} class="timeline-item">
+                    <span class="timeline-marker">{#if isCurrentCheckpoint}<span></span>{/if}</span>
+                    <div class="timeline-content">
+                      <div class="timeline-title-row">
+                        <h3>{checkpointLabel(checkpoint)}</h3>
+                        {#if isCurrentCheckpoint}<span class="latest-badge">{project.currentChanges.length > 0 ? "保存基准" : "当前"}</span>{/if}
                       </div>
                       <p class="timeline-time">{formatTime(checkpoint.createdAt)}</p>
                       {#if checkpoint.kind === "git"}<span class="readonly-note">Git 提交 · 仅查看</span>{/if}
@@ -503,24 +700,48 @@
                   </li>
                 {/each}
               </ol>
-              {#if project.hasMoreCheckpoints}
-                <button class="load-more-button" onclick={loadMoreCheckpoints} disabled={loading}>加载更早的版本</button>
-              {/if}
+              {#if project.hasMoreCheckpoints}<button class="load-more-button" onclick={loadMoreCheckpoints} disabled={loading}>加载更早的记录</button>{/if}
             {/if}
           </section>
         </div>
 
         <footer class="local-footer">
-          <span><span class="privacy-dot"></span>所有版本都保存在本地电脑</span>
-          <button class="stop-protection-link" onclick={() => stopProtectionOpen = true} disabled={loading}>停止 EasilyGit 管理</button>
+          <button class="stop-protection-link" onclick={() => stopProtectionOpen = true} disabled={loading}>停止此文件夹的保护</button>
         </footer>
       {/if}
     </section>
   {/if}
 
-  {#if loading}
-    <div class="loading-indicator" aria-live="polite"><span></span>正在处理…</div>
-  {/if}
+  <footer class="app-statusbar" aria-label="应用状态" aria-live="polite">
+    <div class="statusbar-left">
+      <strong>MosSaver</strong>
+      {#if project?.initialized}
+        <span class="statusbar-divider"></span><span>{project.name}</span>
+      {:else if !project && managedPaths.length > 0}
+        <span class="statusbar-divider"></span><span>{managedPaths.length} 个文件夹</span>
+      {/if}
+    </div>
+    <div class="statusbar-right">
+      {#if loading || refreshingFolders}
+        <span class="statusbar-state is-busy"><span class="statusbar-spinner"></span>{loading ? "正在处理…" : "正在同步状态…"}</span>
+      {:else if project?.initialized}
+        <span class="statusbar-state" class:has-changes={project.currentChanges.length > 0}>
+          <span class="statusbar-dot"></span>
+          {project.currentChanges.length > 0 ? `${project.currentChanges.length} 项变化，尚未保存` : "已保存"}
+        </span>
+      {:else if project}
+        <span class="statusbar-state is-muted"><span class="statusbar-dot"></span>保护未开启</span>
+      {:else if inaccessibleFolderCount > 0}
+        <span class="statusbar-state has-warning"><span class="statusbar-dot"></span>{inaccessibleFolderCount} 个文件夹无法读取</span>
+      {:else if changedFolderCount > 0}
+        <span class="statusbar-state has-changes"><span class="statusbar-dot"></span>{changedFolderCount} 个文件夹有变化</span>
+      {:else if managedPaths.length > 0}
+        <span class="statusbar-state"><span class="statusbar-dot"></span>文件夹状态正常</span>
+      {:else}
+        <span class="statusbar-state is-muted"><span class="statusbar-dot"></span>准备就绪</span>
+      {/if}
+    </div>
+  </footer>
 </main>
 
 {#if (dialogMode === "restore" && selectedCheckpoint !== null) || dialogMode === "undo"}
@@ -531,11 +752,11 @@
       {#if dialogMode === "undo"}
         <p id="restore-description">项目会回到上次恢复之前的状态。操作前会自动保存现在的文件变化；完成后，这次恢复不能再次撤销。</p>
       {:else if selectedCheckpoint}
-        <p id="restore-description">项目文件会回到 <strong>{formatTime(selectedCheckpoint.createdAt)}</strong> 的状态。EasilyGit 会先自动保存你现在的状态，恢复后也可以撤销。</p>
+        <p id="restore-description">项目文件会回到 <strong>{formatTime(selectedCheckpoint.createdAt)}</strong> 的状态。MosSaver 会先自动保存现在的状态，恢复后也可以撤销。</p>
       {/if}
       {#if errorMessage}<p class="modal-error" role="alert">{errorMessage}</p>{/if}
       <div class="modal-actions">
-        <button class="button button-quiet" onclick={() => { selectedCheckpoint = null; dialogMode = null; }} disabled={loading}>再想一想</button>
+        <button class="button button-subtle" onclick={() => { selectedCheckpoint = null; dialogMode = null; }} disabled={loading}>取消</button>
         <button class="button button-primary" onclick={dialogMode === "undo" ? undoRestore : restoreVersion} disabled={loading}>{dialogMode === "undo" ? "撤销恢复" : "恢复这个版本"}</button>
       </div>
     </dialog>
@@ -546,34 +767,25 @@
   <div class="modal-backdrop" role="presentation">
     <dialog open class="file-manager-modal" aria-modal="true" aria-labelledby="file-manager-title">
       <div class="file-manager-heading">
-        <div>
-          <p class="eyebrow">项目文件</p>
-          <h2 id="file-manager-title">管理哪些文件</h2>
-        </div>
+        <div><p class="eyebrow">项目文件</p><h2 id="file-manager-title">选择要保护的文件</h2></div>
         <button class="error-dismiss" onclick={() => managedFilesOpen = false} aria-label="关闭">×</button>
       </div>
-      <p class="file-manager-description">停止管理后，文件仍保留在电脑上；EasilyGit 不再保存或恢复它。Git 自身的跟踪状态不会改变。</p>
+      <p class="file-manager-description">停止保护某个文件后，它仍会留在电脑上；MosSaver 不再保存或恢复它。Git 自身的跟踪状态不会改变。</p>
       {#if errorMessage}<p class="modal-error" role="alert">{errorMessage}</p>{/if}
       {#if managedFiles.length === 0}
-        <div class="empty-managed-files">项目里还没有可管理的文件。</div>
+        <div class="empty-managed-files">这个项目里还没有可管理的文件。</div>
       {:else}
         <ul class="managed-file-list">
           {#each managedFiles as file (file.path)}
             <li>
-              <div class="managed-file-copy">
-                <span class="managed-file-name" title={file.path}>{fileName(file.path)}</span>
-                <span class="managed-file-path" title={file.path}>{file.path}</span>
-              </div>
-              {#if file.managed}
-                <button class="file-rule-button" onclick={() => toggleFileManagement(file)} disabled={loading}>停止管理</button>
-              {:else}
-                <button class="file-rule-button file-rule-enable" onclick={() => toggleFileManagement(file)} disabled={loading}>恢复管理</button>
-              {/if}
+              <div class="managed-file-copy"><span class="managed-file-name" title={file.path}>{fileName(file.path)}</span><span class="managed-file-path" title={file.path}>{file.path}</span></div>
+              {#if file.managed}<button class="file-rule-button" onclick={() => toggleFileManagement(file)} disabled={loading}>停止保护</button>
+              {:else}<button class="file-rule-button file-rule-enable" onclick={() => toggleFileManagement(file)} disabled={loading}>恢复保护</button>{/if}
             </li>
           {/each}
         </ul>
       {/if}
-      <div class="modal-actions"><button class="button button-quiet" onclick={() => managedFilesOpen = false}>完成</button></div>
+      <div class="modal-actions"><button class="button button-subtle" onclick={() => managedFilesOpen = false}>完成</button></div>
     </dialog>
   </div>
 {/if}
@@ -582,12 +794,12 @@
   <div class="modal-backdrop" role="presentation">
     <dialog open class="confirm-modal" aria-modal="true" aria-labelledby="stop-protection-title" aria-describedby="stop-protection-description">
       <div class="modal-icon modal-icon-danger">!</div>
-      <h2 id="stop-protection-title">停止 EasilyGit 管理？</h2>
-      <p id="stop-protection-description">这会删除 EasilyGit 的版本记录、文件管理设置和独立存储。项目文件、普通 Git 提交、分支和暂存区会保留。旧版本写入原 Git 存储的数据，可能需要 Git 后续整理时回收。</p>
+      <h2 id="stop-protection-title">停止此文件夹的保护？</h2>
+      <p id="stop-protection-description">这会删除 MosSaver 的版本记录、文件保护设置和独立存储。项目文件、普通 Git 提交、分支和暂存区会保留。</p>
       {#if errorMessage}<p class="modal-error" role="alert">{errorMessage}</p>{/if}
       <div class="modal-actions">
-        <button class="button button-quiet" onclick={() => stopProtectionOpen = false} disabled={loading}>取消</button>
-        <button class="button button-danger" onclick={stopProtection} disabled={loading}>停止管理并清理记录</button>
+        <button class="button button-subtle" onclick={() => stopProtectionOpen = false} disabled={loading}>取消</button>
+        <button class="button button-danger" onclick={stopProtection} disabled={loading}>停止保护并清理记录</button>
       </div>
     </dialog>
   </div>

@@ -12,6 +12,19 @@ const HISTORY_FORMAT: &str = "--format=tformat:%H%x00%cI%x00%s";
 
 pub(super) fn update_existing_history(root: &Path, metadata: &mut Metadata) -> AppResult<bool> {
     let mut changed = false;
+    // Older builds temporarily used the native Git HEAD as the active
+    // comparison point. Migrate that value back to MosSaver's own latest
+    // checkpoint so a Git checkout/reset is reported as a file change.
+    if metadata
+        .current_checkpoint
+        .as_deref()
+        .is_some_and(|id| id.starts_with("git-"))
+    {
+        if let Some(checkpoint) = latest_mossaver_checkpoint(metadata) {
+            metadata.current_checkpoint = Some(checkpoint.id.clone());
+            changed = true;
+        }
+    }
     if !metadata.git_history_refs_cleaned {
         remove_legacy_git_references(root)?;
         initialize_history_order(metadata);
@@ -20,8 +33,6 @@ pub(super) fn update_existing_history(root: &Path, metadata: &mut Metadata) -> A
     }
 
     let head = snapshot::head_commit(root);
-    let previous_head = metadata.last_observed_head.clone();
-    let first_history_sync = !metadata.git_history_imported && previous_head.is_none();
     let mut tips = repository_tips(root)?;
     if let Some(head) = &head {
         tips.push(head.clone());
@@ -44,15 +55,18 @@ pub(super) fn update_existing_history(root: &Path, metadata: &mut Metadata) -> A
         metadata.git_history_imported = true;
     }
 
-    if head_changed && !first_history_sync {
-        metadata.current_checkpoint = head.as_ref().map(|head| format!("git-{head}"));
-    } else if metadata.current_checkpoint.is_none()
-        && let Some(head) = &head
-    {
-        metadata.current_checkpoint = Some(format!("git-{head}"));
-    }
+    // Native Git history is read-only context. It must never replace the
+    // MosSaver checkpoint used to calculate current file changes.
     metadata.last_observed_head = head;
     Ok(true)
+}
+
+fn latest_mossaver_checkpoint(metadata: &Metadata) -> Option<&Checkpoint> {
+    metadata
+        .checkpoints
+        .iter()
+        .rev()
+        .find(|checkpoint| checkpoint.kind != CheckpointKind::Git)
 }
 
 pub(super) fn load_next_history_page(root: &Path, metadata: &mut Metadata) -> AppResult<bool> {

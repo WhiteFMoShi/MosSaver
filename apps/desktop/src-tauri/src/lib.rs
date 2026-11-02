@@ -1,5 +1,7 @@
 use std::{
+    collections::HashSet,
     ffi::OsStr,
+    fs,
     path::{Path, PathBuf},
     process::Command,
     sync::{Mutex, mpsc},
@@ -8,14 +10,21 @@ use std::{
 };
 
 use easilygit_app::ProjectService;
-use easilygit_domain::{AppError, CheckpointPage, ManagedFile, ProjectState};
+use easilygit_domain::{AppError, CheckpointPage, ManagedFile, ProjectOverview, ProjectState};
 use easilygit_git::SystemGitBackend;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State, async_runtime};
+use tauri::{AppHandle, Emitter, Manager, State, async_runtime};
 
 #[derive(Default)]
 struct ProjectWatcher(Mutex<Option<RecommendedWatcher>>);
+
+#[derive(Clone)]
+struct WatchTargets {
+    root: PathBuf,
+    git_directory: Option<PathBuf>,
+    refs_directory: Option<PathBuf>,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +61,15 @@ async fn open_project(
 ) -> Result<ProjectState, CommandError> {
     let service = service.inner().clone();
     run_blocking(move || service.open_project(&PathBuf::from(path))).await
+}
+
+#[tauri::command]
+async fn project_overview(
+    path: String,
+    service: State<'_, ProjectService<SystemGitBackend>>,
+) -> Result<ProjectOverview, CommandError> {
+    let service = service.inner().clone();
+    run_blocking(move || service.project_overview(&PathBuf::from(path))).await
 }
 
 #[tauri::command]
@@ -141,33 +159,118 @@ async fn disable_protection(
 }
 
 #[tauri::command]
-fn watch_project(
-    path: String,
+fn list_managed_projects(app: AppHandle) -> Result<Vec<String>, String> {
+    let path = catalog_file(&app)?;
+    read_project_catalog(&path)
+}
+
+#[tauri::command]
+fn add_managed_project(app: AppHandle, path: String) -> Result<Vec<String>, String> {
+    let root = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("Could not open folder: {error}"))?;
+    if !root.is_dir() {
+        return Err("The selected path is not a folder".to_owned());
+    }
+    let catalog = catalog_file(&app)?;
+    let mut projects = read_project_catalog(&catalog)?;
+    let root = root.to_string_lossy().into_owned();
+    if !projects.iter().any(|project| project == &root) {
+        projects.push(root);
+        write_project_catalog(&catalog, &projects)?;
+    }
+    Ok(projects)
+}
+
+#[tauri::command]
+fn remove_managed_project(app: AppHandle, path: String) -> Result<Vec<String>, String> {
+    let catalog = catalog_file(&app)?;
+    let mut projects = read_project_catalog(&catalog)?;
+    projects.retain(|project| project != &path);
+    write_project_catalog(&catalog, &projects)?;
+    Ok(projects)
+}
+
+fn catalog_file(app: &AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Could not locate MosSaver data folder: {error}"))?;
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create MosSaver data folder: {error}"))?;
+    Ok(directory.join("managed-folders.json"))
+}
+
+fn read_project_catalog(path: &Path) -> Result<Vec<String>, String> {
+    let contents = match fs::read(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("Could not read managed folder list: {error}")),
+    };
+    let mut projects: Vec<String> = serde_json::from_slice(&contents)
+        .map_err(|error| format!("Managed folder list is invalid: {error}"))?;
+    let mut seen = HashSet::new();
+    projects.retain(|project| seen.insert(project.clone()));
+    Ok(projects)
+}
+
+fn write_project_catalog(path: &Path, projects: &[String]) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Managed folder list has no parent folder".to_owned())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Could not create managed folder list: {error}"))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| format!("Could not prepare managed folder list: {error}"))?;
+    serde_json::to_writer_pretty(&mut temporary, projects)
+        .map_err(|error| format!("Could not encode managed folder list: {error}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|error| format!("Could not save managed folder list: {error}"))?;
+    temporary
+        .persist(path)
+        .map_err(|error| format!("Could not replace managed folder list: {}", error.error))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn watch_projects(
+    paths: Vec<String>,
     app: AppHandle,
     watcher_state: State<'_, ProjectWatcher>,
 ) -> Result<(), String> {
-    let root = PathBuf::from(path)
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
-    let root_for_events = root.clone();
-    let git_directory = git_path(&root, &["--absolute-git-dir"]);
-    let common_directory = git_path(&root, &["--git-common-dir"]);
-    let git_and_common_directory_match = git_directory == common_directory;
-    let git_directory_for_events = git_directory.clone();
-    let refs_directory = common_directory
-        .as_ref()
-        .map(|directory| directory.join("refs"));
-    let refs_directory_for_events = refs_directory.clone();
-    let root_for_payload = root.to_string_lossy().into_owned();
-    let (sender, receiver) = mpsc::channel();
+    let targets: Vec<WatchTargets> = paths
+        .into_iter()
+        .filter_map(|path| PathBuf::from(path).canonicalize().ok())
+        .filter(|root| root.is_dir())
+        .map(|root| {
+            let git_directory = git_path(&root, &["--absolute-git-dir"]);
+            let common_directory = git_path(&root, &["--git-common-dir"]);
+            let refs_directory = common_directory.map(|directory| directory.join("refs"));
+            WatchTargets {
+                root,
+                git_directory,
+                refs_directory,
+            }
+        })
+        .collect();
+    let (sender, receiver) = mpsc::channel::<String>();
 
     thread::spawn(move || {
-        while receiver.recv().is_ok() {
+        while let Ok(first_root) = receiver.recv() {
+            let mut changed_roots = vec![first_root];
             loop {
                 match receiver.recv_timeout(Duration::from_millis(350)) {
-                    Ok(()) => continue,
+                    Ok(root) => {
+                        if !changed_roots.contains(&root) {
+                            changed_roots.push(root);
+                        }
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        let _ = app.emit("project-files-changed", &root_for_payload);
+                        for root in changed_roots {
+                            let _ = app.emit("project-files-changed", &root);
+                        }
                         break;
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -176,44 +279,42 @@ fn watch_project(
         }
     });
 
+    let targets_for_events = targets.clone();
     let mut watcher = RecommendedWatcher::new(
         move |event: notify::Result<Event>| {
-            if event.as_ref().is_ok_and(|event| {
-                should_refresh_project(&root_for_events, event)
-                    || git_directory_for_events
-                        .as_ref()
-                        .is_some_and(|directory| should_refresh_git_directory(directory, event))
-                    || refs_directory_for_events.as_ref().is_some_and(|directory| {
-                        should_refresh_reference_directory(directory, event)
-                    })
-            }) {
-                let _ = sender.send(());
+            if let Ok(event) = event {
+                for target in &targets_for_events {
+                    if should_refresh_targets(target, &event) {
+                        let _ = sender.send(target.root.to_string_lossy().into_owned());
+                    }
+                }
             }
         },
         Config::default(),
     )
     .map_err(|error| error.to_string())?;
-    watcher
-        .watch(&root, RecursiveMode::Recursive)
-        .map_err(|error| error.to_string())?;
-    if let Some(directory) = git_directory.filter(|directory| !directory.starts_with(&root)) {
+    for target in &targets {
         watcher
-            .watch(&directory, RecursiveMode::NonRecursive)
+            .watch(&target.root, RecursiveMode::Recursive)
             .map_err(|error| error.to_string())?;
-    }
-    if let Some(directory) = common_directory
-        .filter(|directory| !directory.starts_with(&root) && !git_and_common_directory_match)
-    {
-        watcher
-            .watch(&directory, RecursiveMode::NonRecursive)
-            .map_err(|error| error.to_string())?;
-    }
-    if let Some(directory) =
-        refs_directory.filter(|directory| directory.is_dir() && !directory.starts_with(&root))
-    {
-        watcher
-            .watch(&directory, RecursiveMode::Recursive)
-            .map_err(|error| error.to_string())?;
+        if let Some(directory) = target
+            .git_directory
+            .as_ref()
+            .filter(|directory| !directory.starts_with(&target.root))
+        {
+            watcher
+                .watch(directory, RecursiveMode::NonRecursive)
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(directory) = target
+            .refs_directory
+            .as_ref()
+            .filter(|directory| directory.is_dir() && !directory.starts_with(&target.root))
+        {
+            watcher
+                .watch(directory, RecursiveMode::Recursive)
+                .map_err(|error| error.to_string())?;
+        }
     }
 
     let mut current = watcher_state
@@ -222,6 +323,18 @@ fn watch_project(
         .map_err(|_| "Project watcher state is unavailable".to_owned())?;
     *current = Some(watcher);
     Ok(())
+}
+
+fn should_refresh_targets(target: &WatchTargets, event: &Event) -> bool {
+    should_refresh_project(&target.root, event)
+        || target
+            .git_directory
+            .as_ref()
+            .is_some_and(|directory| should_refresh_git_directory(directory, event))
+        || target
+            .refs_directory
+            .as_ref()
+            .is_some_and(|directory| should_refresh_reference_directory(directory, event))
 }
 
 #[tauri::command]
@@ -334,6 +447,7 @@ pub fn run() {
         .manage(ProjectWatcher::default())
         .invoke_handler(tauri::generate_handler![
             open_project,
+            project_overview,
             initialize_project,
             refresh_project,
             save_version,
@@ -343,17 +457,21 @@ pub fn run() {
             list_managed_files,
             set_file_managed,
             disable_protection,
-            watch_project,
+            list_managed_projects,
+            add_managed_project,
+            remove_managed_project,
+            watch_projects,
             stop_project_watch
         ])
         .run(tauri::generate_context!())
-        .expect("error while running EasilyGit");
+        .expect("error while running MosSaver");
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        should_refresh_git_directory, should_refresh_project, should_refresh_reference_directory,
+        WatchTargets, read_project_catalog, should_refresh_git_directory, should_refresh_project,
+        should_refresh_reference_directory, should_refresh_targets, write_project_catalog,
     };
     use notify::{Event, EventKind, event::ModifyKind};
     use std::path::Path;
@@ -393,5 +511,41 @@ mod tests {
             refs_directory,
             &tag_change
         ));
+    }
+
+    #[test]
+    fn watcher_matches_events_for_multiple_managed_projects() {
+        let first = WatchTargets {
+            root: Path::new("first").to_path_buf(),
+            git_directory: None,
+            refs_directory: None,
+        };
+        let second = WatchTargets {
+            root: Path::new("second").to_path_buf(),
+            git_directory: None,
+            refs_directory: None,
+        };
+        let first_change = Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(Path::new("first/src/lib.rs").to_path_buf());
+        assert!(should_refresh_targets(&first, &first_change));
+        assert!(!should_refresh_targets(&second, &first_change));
+    }
+
+    #[test]
+    fn project_catalog_is_deduplicated_and_replaced_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("managed-folders.json");
+        let projects = vec![
+            "/first".to_owned(),
+            "/second".to_owned(),
+            "/first".to_owned(),
+        ];
+        write_project_catalog(&path, &projects).unwrap();
+        assert_eq!(
+            read_project_catalog(&path).unwrap(),
+            vec!["/first", "/second"]
+        );
+        write_project_catalog(&path, &["/second".to_owned()]).unwrap();
+        assert_eq!(read_project_catalog(&path).unwrap(), vec!["/second"]);
     }
 }
