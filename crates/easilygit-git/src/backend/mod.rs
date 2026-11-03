@@ -2,6 +2,8 @@ mod commands;
 mod files;
 mod history;
 mod management;
+mod operations;
+mod preview;
 mod restore;
 mod snapshot;
 mod status;
@@ -11,7 +13,7 @@ use std::path::{Path, PathBuf};
 use easilygit_app::ProjectPort;
 use easilygit_domain::{
     AppError, AppResult, ChangedFile, Checkpoint, CheckpointDetails, CheckpointKind,
-    CheckpointPage, ManagedFile,
+    CheckpointPage, FilePreview, ManagedFile,
 };
 
 use crate::metadata::{self, Metadata};
@@ -126,8 +128,18 @@ impl ProjectPort for SystemGitBackend {
         }
         let has_more =
             visible.len() > offset.saturating_add(limit) || metadata.git_history_has_more;
+        let deletion_blocks = operations::deletion_blocks(&metadata);
         Ok(CheckpointPage {
-            checkpoints: visible.into_iter().skip(offset).take(limit).collect(),
+            checkpoints: visible
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|mut checkpoint| {
+                    checkpoint.delete_blocked_reason =
+                        deletion_blocks.get(checkpoint.id.as_str()).copied();
+                    checkpoint
+                })
+                .collect(),
             has_more,
         })
     }
@@ -147,6 +159,24 @@ impl ProjectPort for SystemGitBackend {
         Ok(metadata
             .current_checkpoint
             .filter(|id| !id.starts_with("git-")))
+    }
+
+    fn file_preview(&self, root: &Path, id: &str, file_path: &str) -> AppResult<FilePreview> {
+        preview::file_preview(self, root, id, file_path)
+    }
+
+    fn delete_checkpoint(&self, root: &Path, id: &str) -> AppResult<()> {
+        operations::delete_checkpoint(self, root, id)
+    }
+
+    fn merge_checkpoints(
+        &self,
+        root: &Path,
+        source: &str,
+        target: &str,
+        label: &str,
+    ) -> AppResult<()> {
+        operations::merge_checkpoints(self, root, source, target, label)
     }
 
     fn has_user_checkpoint(&self, root: &Path) -> AppResult<bool> {

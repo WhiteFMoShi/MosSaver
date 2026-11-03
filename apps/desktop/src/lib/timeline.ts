@@ -2,6 +2,7 @@ export interface TimelineCheckpoint {
   id: string;
   createdAt: string;
   parentId: string | null;
+  mergeParentIds?: readonly string[];
 }
 
 export interface TimelineEntry<T extends TimelineCheckpoint = TimelineCheckpoint> {
@@ -67,10 +68,22 @@ export function buildTimelineEntries<T extends TimelineCheckpoint>(
     siblings.sort((left, right) => oldestIndex.get(left.id)! - oldestIndex.get(right.id)!);
   }
   const activePath = new Set<string>();
-  let active = byId.get(currentCheckpointId ?? "");
-  while (active && !activePath.has(active.id)) {
+  const pendingAncestors = [currentCheckpointId ?? ""];
+  while (pendingAncestors.length) {
+    const active = byId.get(pendingAncestors.pop()!);
+    if (!active || activePath.has(active.id)) continue;
     activePath.add(active.id);
-    active = active.parentId ? byId.get(active.parentId) : undefined;
+    if (active.parentId) pendingAncestors.push(active.parentId);
+    pendingAncestors.push(...(active.mergeParentIds ?? []));
+  }
+  // Highlight every source of a merge, but reserve lane zero for the active
+  // version's first-parent chain. Picking any highlighted child could put a
+  // merge source on lane zero and move the current version to a side lane.
+  const primaryPath = new Set<string>();
+  let primary = byId.get(currentCheckpointId ?? "");
+  while (primary && !primaryPath.has(primary.id)) {
+    primaryPath.add(primary.id);
+    primary = primary.parentId ? byId.get(primary.parentId) : undefined;
   }
   const laneById = new Map<string, number>();
   const siblingById = new Set<string>();
@@ -91,7 +104,7 @@ export function buildTimelineEntries<T extends TimelineCheckpoint>(
       }
       // Restoring a version ends the active lane there. Its existing children
       // must move aside so the working-state edge cannot run through them.
-      const mainChild = childList.find((child) => activePath.has(child.id))
+      const mainChild = childList.find((child) => primaryPath.has(child.id))
         ?? (checkpoint.id === currentCheckpointId ? undefined : childList[0]);
       for (let index = childList.length - 1; index >= 0; index--) {
         const child = childList[index];
@@ -103,7 +116,7 @@ export function buildTimelineEntries<T extends TimelineCheckpoint>(
   // A missing parent is a separate component on this loaded page. Giving all
   // roots lane zero would draw other roots directly on an unrelated edge.
   const roots = oldestFirst.filter((checkpoint) => !checkpoint.parentId || !byId.has(checkpoint.parentId));
-  roots.sort((left, right) => Number(activePath.has(right.id)) - Number(activePath.has(left.id)));
+  roots.sort((left, right) => Number(primaryPath.has(right.id)) - Number(primaryPath.has(left.id)));
   for (const checkpoint of roots) visit(checkpoint, visited.size === 0 ? 0 : nextLane++);
   for (const checkpoint of oldestFirst) {
     if (!visited.has(checkpoint.id)) visit(checkpoint, visited.size === 0 ? 0 : nextLane++);
@@ -289,6 +302,12 @@ export function buildTimelineGraph(
     if (entry.parent) {
       connect(entry.checkpoint.id, entry.parent.id,
         entry.isActiveLineage && Boolean(entryById.get(entry.parent.id)?.isActiveLineage));
+    }
+    for (const parentId of entry.checkpoint.mergeParentIds ?? []) {
+      if (parentId !== entry.checkpoint.parentId) {
+        connect(entry.checkpoint.id, parentId,
+          entry.isActiveLineage && Boolean(entryById.get(parentId)?.isActiveLineage));
+      }
     }
   }
   if (currentCheckpointId) connect(CURRENT_FILES_ID, currentCheckpointId, true);

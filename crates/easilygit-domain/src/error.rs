@@ -16,6 +16,12 @@ pub enum AppError {
     CheckpointNotFound,
     #[error("Git history entries can be viewed but not restored by MosSaver.")]
     CheckpointReadOnly,
+    #[error("Only an inactive leaf checkpoint that is not a recovery point can be deleted.")]
+    CheckpointInUse,
+    #[error("These versions cannot be merged: {0}")]
+    MergeNotAllowed(String),
+    #[error("The versions contain conflicting changes. No checkpoint was created. {0}")]
+    MergeConflict(String),
     #[error("There is no restore operation to undo.")]
     NothingToUndo,
     #[error("A repository path or file name could not be represented safely.")]
@@ -41,6 +47,9 @@ impl AppError {
             Self::NotInitialized => "NOT_INITIALIZED",
             Self::CheckpointNotFound => "CHECKPOINT_NOT_FOUND",
             Self::CheckpointReadOnly => "CHECKPOINT_READ_ONLY",
+            Self::CheckpointInUse => "CHECKPOINT_IN_USE",
+            Self::MergeNotAllowed(_) => "MERGE_NOT_ALLOWED",
+            Self::MergeConflict(_) => "MERGE_CONFLICT",
             Self::NothingToUndo => "NOTHING_TO_UNDO",
             Self::InvalidPath => "INVALID_PATH",
             Self::PermissionDenied => "PERMISSION_DENIED",

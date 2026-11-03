@@ -5,6 +5,7 @@
   import { cubicOut } from "svelte/easing";
   import { onMount } from "svelte";
   import { fly } from "svelte/transition";
+  import FileDiff from "./lib/FileDiff.svelte";
   import {
     buildTimelineEntries,
     buildTimelineGraph,
@@ -27,7 +28,9 @@
     createdAt: string;
     kind: "user" | "git" | "automatic";
     parentId: string | null;
+    mergeParentIds: string[];
     summary: CheckpointSummary | null;
+    deleteBlockedReason?: "readOnly" | "current" | "recovery" | "hasChildren" | null;
   }
 
   interface CheckpointSummary {
@@ -81,7 +84,14 @@
   let refreshingFolders = $state(false);
   let errorMessage = $state("");
   let selectedCheckpoint = $state<Checkpoint | null>(null);
-  let dialogMode = $state<"save" | "restore" | "undo" | null>(null);
+  let dialogMode = $state<"save" | "restore" | "undo" | "delete" | "merge" | null>(null);
+  let focusedCheckpointId = $state<string | null>(null);
+  let draggedCheckpointId = $state<string | null>(null);
+  let dropCheckpointId = $state<string | null>(null);
+  let mergeSource = $state<Checkpoint | null>(null);
+  let mergeTargetId = $state("");
+  let mergeLabel = $state("");
+  let operationNotice = $state("");
   let saveLabel = $state("");
   let checkpointDetails = $state<Record<string, CheckpointDetails>>({});
   let expandedCheckpointId = $state<string | null>(null);
@@ -95,6 +105,7 @@
   let stopProtectionOpen = $state(false);
   let theme = $state<Theme>("light");
   let loadedCheckpointCount = 0;
+  let detailsRequest = 0;
   let autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let pendingRefreshRoot: string | undefined;
   let lastFocusRefreshAt = 0;
@@ -171,11 +182,14 @@
   const timelineEntries = $derived(
     buildTimelineEntries(project?.checkpoints ?? [], project?.currentCheckpointId ?? null),
   );
+  const checkpointsById = $derived(new Map((project?.checkpoints ?? []).map((checkpoint) => [checkpoint.id, checkpoint])));
+  const mergeTargets = $derived(project?.checkpoints.filter((checkpoint) => checkpoint.kind !== "git" && checkpoint.id !== mergeSource?.id) ?? []);
 
   $effect(() => {
     timelineEntries;
     showCurrentFilesNode;
     expandedCheckpointId;
+    focusedCheckpointId;
     if (!timelineHost) return;
     const frame = requestAnimationFrame(measureTimelineGraph);
     return () => cancelAnimationFrame(frame);
@@ -377,6 +391,10 @@
   }
 
   async function toggleCheckpointDetails(checkpoint: Checkpoint) {
+    const root = project?.root;
+    if (!root) return;
+    const request = ++detailsRequest;
+    loadingCheckpointId = null;
     if (expandedCheckpointId === checkpoint.id) {
       expandedCheckpointId = null;
       return;
@@ -386,16 +404,111 @@
     loadingCheckpointId = checkpoint.id;
     try {
       const details = await invoke<CheckpointDetails>("checkpoint_details", {
-        path: project!.root,
+        path: root,
         checkpointId: checkpoint.id,
       });
-      checkpointDetails = { ...checkpointDetails, [checkpoint.id]: details };
+      if (request === detailsRequest && project?.root === root) {
+        checkpointDetails = { ...checkpointDetails, [checkpoint.id]: details };
+      }
     } catch (error) {
-      errorMessage = friendlyError(error);
-      expandedCheckpointId = null;
+      if (request === detailsRequest && project?.root === root) {
+        errorMessage = friendlyError(error);
+        expandedCheckpointId = null;
+      }
     } finally {
-      loadingCheckpointId = null;
+      if (request === detailsRequest) loadingCheckpointId = null;
     }
+  }
+
+  function selectNode(id: string) {
+    if (loading || id === CURRENT_FILES_ID) return;
+    focusedCheckpointId = focusedCheckpointId === id ? null : id;
+  }
+
+  function deletionReason(checkpoint: Checkpoint): string {
+    const reasons = {
+      readOnly: "Git 历史仅供查看",
+      current: "当前版本不能删除，请先切换到其他版本",
+      recovery: "这是撤销恢复所需的安全点，不能删除",
+      hasChildren: "此存档仍被后续版本或恢复安全点使用，不能删除",
+    };
+    if (checkpoint.deleteBlockedReason) return reasons[checkpoint.deleteBlockedReason];
+    if (checkpoint.kind === "git") return "Git 历史仅供查看";
+    if (checkpoint.id === project?.currentCheckpointId) return "当前版本不能删除，请先切换到其他版本";
+    if (project?.checkpoints.some((child) => child.parentId === checkpoint.id || child.mergeParentIds?.includes(checkpoint.id))) return "已有后续版本，不能删除";
+    return "删除存档点";
+  }
+
+  function requestDelete(checkpoint: Checkpoint) {
+    if (loading) return;
+    const reason = deletionReason(checkpoint);
+    if (reason !== "删除存档点") { errorMessage = reason; return; }
+    selectedCheckpoint = checkpoint;
+    errorMessage = "";
+    dialogMode = "delete";
+  }
+
+  function openMerge(source: Checkpoint, target?: Checkpoint) {
+    if (loading || source.kind === "git" || source.id === target?.id || target?.kind === "git") return;
+    mergeSource = source;
+    mergeTargetId = target?.id ?? (project?.currentCheckpointId !== source.id ? project?.currentCheckpointId ?? "" : "");
+    mergeLabel = `合并：${checkpointLabel(source)}`.slice(0, 120);
+    errorMessage = "";
+    dialogMode = "merge";
+  }
+
+  function startNodeDrag(event: DragEvent, checkpoint: Checkpoint) {
+    if (loading || checkpoint.kind === "git") { event.preventDefault(); return; }
+    draggedCheckpointId = checkpoint.id;
+    focusedCheckpointId = checkpoint.id;
+    event.dataTransfer?.setData("application/x-mossaver-checkpoint", checkpoint.id);
+    if (event.dataTransfer) event.dataTransfer.effectAllowed = "linkMove";
+  }
+
+  function dragOverNode(event: DragEvent, checkpoint: Checkpoint) {
+    if (loading || !draggedCheckpointId || draggedCheckpointId === checkpoint.id || checkpoint.kind === "git") return;
+    event.preventDefault();
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "link";
+    dropCheckpointId = checkpoint.id;
+  }
+
+  function endNodeDrag() { draggedCheckpointId = null; dropCheckpointId = null; }
+
+  function dropOnNode(event: DragEvent, checkpoint: Checkpoint) {
+    event.preventDefault();
+    const source = checkpointsById.get(draggedCheckpointId ?? "");
+    endNodeDrag();
+    if (source) openMerge(source, checkpoint);
+  }
+
+  async function deleteVersion() {
+    if (!project || !selectedCheckpoint || loading) return;
+    const checkpoint = selectedCheckpoint;
+    await perform(async () => {
+      const updated = await invoke<ProjectState>("delete_checkpoint", { path: project!.root, checkpointId: checkpoint.id });
+      await adoptProjectState(updated, Math.max(0, loadedCheckpointCount - 1));
+      updateFolderOverviewFromProject(updated);
+      if (expandedCheckpointId === checkpoint.id) expandedCheckpointId = null;
+      const { [checkpoint.id]: _deleted, ...details } = checkpointDetails;
+      checkpointDetails = details;
+      focusedCheckpointId = null; selectedCheckpoint = null; dialogMode = null;
+      operationNotice = "已删除存档点";
+    });
+  }
+
+  async function mergeVersions() {
+    if (!project || !mergeSource || !mergeTargetId || loading) return;
+    const existingIds = new Set(project.checkpoints.map((checkpoint) => checkpoint.id));
+    await perform(async () => {
+      const updated = await invoke<ProjectState>("merge_checkpoints", {
+        path: project!.root, sourceId: mergeSource!.id, targetId: mergeTargetId, label: mergeLabel,
+      });
+      await adoptProjectState(updated, loadedCheckpointCount + 1);
+      updateFolderOverviewFromProject(updated);
+      focusedCheckpointId = project?.checkpoints.find((checkpoint) => !existingIds.has(checkpoint.id) && checkpoint.parentId === mergeTargetId && checkpoint.mergeParentIds?.includes(mergeSource!.id))?.id ?? null;
+      dialogMode = null;
+      operationNotice = "合并存档已创建 · 当前文件保持原样，可选择合并存档恢复";
+    });
   }
 
   async function restoreVersion() {
@@ -451,6 +564,8 @@
   }
 
   function returnHome() {
+    detailsRequest++;
+    loadingCheckpointId = null;
     project = null;
     openingProjectPath = null;
     errorMessage = "";
@@ -459,9 +574,22 @@
     managedFilesOpen = false;
     stopProtectionOpen = false;
     loadedCheckpointCount = 0;
+    focusedCheckpointId = null;
+    endNodeDrag();
+    operationNotice = "";
+    checkpointDetails = {};
+    expandedCheckpointId = null;
   }
 
   async function adoptProjectState(next: ProjectState, preserveCheckpointCount: number) {
+    if (project?.root !== next.root) {
+      detailsRequest++;
+      loadingCheckpointId = null;
+      checkpointDetails = {};
+      expandedCheckpointId = null;
+      focusedCheckpointId = null;
+      operationNotice = "";
+    }
     let checkpoints = next.checkpoints;
     let hasMoreCheckpoints = next.hasMoreCheckpoints;
     while (checkpoints.length < preserveCheckpointCount && hasMoreCheckpoints) {
@@ -535,6 +663,7 @@
   }
 
   async function perform(action: () => Promise<void>) {
+    if (loading) return;
     loading = true;
     errorMessage = "";
     try {
@@ -561,6 +690,9 @@
         NOT_INITIALIZED: "请先为这个文件夹开启版本保护。",
         CHECKPOINT_NOT_FOUND: "找不到这个版本，它可能已经被移除。",
         CHECKPOINT_READ_ONLY: "这是原有 Git 提交，只能查看，不能通过 MosSaver 恢复。",
+        CHECKPOINT_IN_USE: "这个存档是当前版本、其他版本的来源或恢复安全点，暂时不能删除。",
+        MERGE_NOT_ALLOWED: "这两个版本无法合并。请选择两个从共同存档派生、且互不包含的版本，并确认 Git 为 2.38 或更新版本。",
+        MERGE_CONFLICT: "两个版本修改了同一处内容，暂时无法自动合并。项目文件和原有存档保持原样。",
         NOTHING_TO_UNDO: "现在没有可以撤销的恢复操作。",
         INVALID_PATH: "项目中有一个文件名无法安全处理。",
         PERMISSION_DENIED: "没有权限访问项目文件，请检查文件夹权限。",
@@ -847,8 +979,14 @@
 
           <section class="panel history-panel">
             <div class="panel-heading">
-              <div><h2>保存记录</h2><p>MosSaver 版本可恢复 · Git 提交仅查看</p></div>
-              <span class="history-total">{project.checkpoints.length}{project.hasMoreCheckpoints ? "+" : ""} 个</span>
+              <div><h2>保存记录</h2><p>{draggedCheckpointId ? "拖到另一个节点合并，或拖到垃圾桶删除" : "点击节点操作 · 拖动节点合并 · Git 历史仅查看"}</p></div>
+              {#if draggedCheckpointId}
+                <button class="node-trash-target icon-action" aria-label="拖到此处删除存档点" title="拖到此处删除存档点"
+                  ondragover={(event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = "move"; }}
+                  ondrop={(event) => { event.preventDefault(); const checkpoint = checkpointsById.get(draggedCheckpointId!); endNodeDrag(); if (checkpoint) requestDelete(checkpoint); }}>
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M7 5V3h6v2M5 5l1 12h8l1-12M8 8v6m4-6v6"/></svg>
+                </button>
+              {:else}<span class="history-total">{project.checkpoints.length}{project.hasMoreCheckpoints ? "+" : ""} 个</span>{/if}
             </div>
             {#if project.checkpoints.length === 0}
               <div class="empty-panel"><span class="history-empty-icon">◷</span><strong>还没有保存记录</strong><span>保存当前版本，为项目留下一个安全点。</span></div>
@@ -871,15 +1009,31 @@
                       <circle
                         class:graph-node-active={node.active}
                         class:graph-node-current={node.current}
+                        class:graph-node-selected={focusedCheckpointId === node.id}
                         data-node-id={node.id}
                         cx={node.x}
                         cy={node.y}
-                        r={node.current ? 6 : 5}
+                        r={focusedCheckpointId === node.id ? 9 : node.current ? 6 : 5}
                       ></circle>
                       {#if node.current}<circle class="graph-node-dot" cx={node.x} cy={node.y} r="2.2"></circle>{/if}
                     {/each}
                   </svg>
                 {/if}
+                <li class="graph-controls" aria-label="版本图节点">
+                {#each timelineGraph.nodes as node (node.id)}
+                  {@const checkpoint = checkpointsById.get(node.id)}
+                  {#if checkpoint}
+                    <button class="graph-node-control" class:node-selected={focusedCheckpointId === node.id} class:node-drop-target={dropCheckpointId === node.id}
+                      style={`left:${node.x - 13}px;top:${node.y - 13}px`}
+                      aria-label={`选择版本：${checkpointLabel(checkpoint)}`} aria-pressed={focusedCheckpointId === node.id}
+                      title={checkpoint.kind === "git" ? "Git 历史，仅查看" : "点击选择 · 拖到其他节点合并"}
+                      draggable={checkpoint.kind !== "git" && !loading} disabled={loading}
+                      onclick={() => selectNode(node.id)} ondragstart={(event) => startNodeDrag(event, checkpoint)}
+                      ondragend={endNodeDrag} ondragover={(event) => dragOverNode(event, checkpoint)}
+                      ondragleave={() => dropCheckpointId = null} ondrop={(event) => dropOnNode(event, checkpoint)}></button>
+                  {/if}
+                {/each}
+                </li>
                 {#if showCurrentFilesNode}
                   <li class="timeline-item current-files-item" data-timeline-row={CURRENT_FILES_ID}>
                     <div class="timeline-content">
@@ -898,12 +1052,34 @@
                 {#each timelineEntries as entry (entry.checkpoint.id)}
                   {@const checkpoint = entry.checkpoint}
                   {@const isCurrentCheckpoint = checkpoint.id === project.currentCheckpointId}
-                  <li class:current-checkpoint={isCurrentCheckpoint} class:timeline-branch={entry.hasSibling} class:active-lineage={entry.isActiveLineage} class="timeline-item" data-timeline-row={checkpoint.id}>
+                  <li class:current-checkpoint={isCurrentCheckpoint} class:timeline-branch={entry.hasSibling} class:active-lineage={entry.isActiveLineage} class:checkpoint-selected={focusedCheckpointId === checkpoint.id} class:checkpoint-drop-target={dropCheckpointId === checkpoint.id} class="timeline-item" data-timeline-row={checkpoint.id}>
                     <div class="timeline-content">
                       <div class="timeline-title-row" data-timeline-anchor>
-                        <h3>{checkpointLabel(checkpoint)}</h3>
+                        <h3><button class="checkpoint-title-button" aria-pressed={focusedCheckpointId === checkpoint.id}
+                          draggable={checkpoint.kind !== "git" && !loading} disabled={loading}
+                          onclick={() => selectNode(checkpoint.id)} ondragstart={(event) => startNodeDrag(event, checkpoint)}
+                          ondragend={endNodeDrag} ondragover={(event) => dragOverNode(event, checkpoint)}
+                          ondragleave={() => dropCheckpointId = null} ondrop={(event) => dropOnNode(event, checkpoint)}
+                          title={checkpoint.kind === "git" ? "选择版本" : "点击选择 · 拖动合并"}>{checkpointLabel(checkpoint)}</button></h3>
                         {#if isCurrentCheckpoint}<span class="latest-badge">{project.currentChanges.length > 0 ? "保存基准" : "当前"}</span>{/if}
+                        {#if checkpoint.mergeParentIds?.length}<span class="merge-badge" title="此存档保留了两条来源连线">合并</span>{/if}
                       </div>
+                      {#if focusedCheckpointId === checkpoint.id && checkpoint.kind !== "git"}
+                        <div class="node-actions" aria-label="版本操作">
+                          <button class="icon-action" data-tooltip="恢复到此版本" aria-label="恢复到此版本" disabled={loading}
+                            onclick={() => { errorMessage = ""; selectedCheckpoint = checkpoint; dialogMode = "restore"; }}>
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8a6 6 0 1 1-.2 3M4 4.5V8h3.5M10 7v3l2 1.2"/></svg>
+                          </button>
+                          <button class="icon-action" data-tooltip="与其他版本合并" aria-label="与其他版本合并" disabled={loading || project.checkpoints.filter((item) => item.kind !== "git").length < 2} onclick={() => openMerge(checkpoint)}>
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="5" cy="4" r="2"/><circle cx="15" cy="4" r="2"/><circle cx="5" cy="16" r="2"/><path d="M5 6v8M15 6c0 5-10 1-10 6"/></svg>
+                          </button>
+                          <span title={deletionReason(checkpoint)}>
+                            <button class="icon-action node-delete" aria-label={deletionReason(checkpoint)} disabled={loading || deletionReason(checkpoint) !== "删除存档点"} onclick={() => requestDelete(checkpoint)}>
+                              <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h14M7 5V3h6v2M5 5l1 12h8l1-12M8 8v6m4-6v6"/></svg>
+                            </button>
+                          </span>
+                        </div>
+                      {/if}
                       <p class="timeline-time">{formatTime(checkpoint.createdAt)}</p>
                       {#if checkpoint.parentId && (entry.hasSibling || isCurrentCheckpoint)}
                         <span class="timeline-fork">
@@ -929,7 +1105,7 @@
                       {#if expandedCheckpointId === checkpoint.id && checkpointDetails[checkpoint.id]}
                         <div class="checkpoint-details">
                           {#each checkpointDetails[checkpoint.id].files as file (file.path)}
-                            <span class="checkpoint-file"><b class="summary-{file.kind}">{file.kind === "added" ? "+" : file.kind === "deleted" ? "−" : "·"}</b>{file.path}</span>
+                            <FileDiff root={project.root} checkpointId={checkpoint.id} path={file.path} kind={file.kind} />
                           {:else}
                             <span class="checkpoint-no-changes">与父版本相比没有文件变化</span>
                           {/each}
@@ -937,12 +1113,6 @@
                       {/if}
                       {#if checkpoint.kind === "git"}<span class="readonly-note">Git 提交 · 仅查看</span>{/if}
                       {#if checkpoint.kind === "automatic"}<span class="automatic-note">自动安全保存</span>{/if}
-                      {#if checkpoint.kind !== "git"}
-                        <button class="restore-link" onclick={() => { selectedCheckpoint = checkpoint; dialogMode = "restore"; }} disabled={loading}>
-                          <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8a6 6 0 1 1-.2 3M4 4.5V8h3.5M10 7v3l2 1.2" /></svg>
-                          恢复到此版本
-                        </button>
-                      {/if}
                     </div>
                   </li>
                 {/each}
@@ -974,6 +1144,7 @@
       {/if}
     </div>
     <div class="statusbar-right">
+      {#if operationNotice}<span class="statusbar-notice" title={operationNotice}>{operationNotice}</span>{/if}
       {#if loading || refreshingFolders}
         <span class="statusbar-state is-busy"><span class="statusbar-spinner"></span>{loading ? "正在处理…" : "正在同步状态…"}</span>
       {:else if project?.initialized}
@@ -1030,6 +1201,43 @@
       <div class="modal-actions">
         <button class="button button-subtle" onclick={() => { selectedCheckpoint = null; dialogMode = null; }} disabled={loading}>取消</button>
         <button class="button button-primary" onclick={dialogMode === "undo" ? undoRestore : restoreVersion} disabled={loading}>{dialogMode === "undo" ? "撤销恢复" : "恢复这个版本"}</button>
+      </div>
+    </dialog>
+  </div>
+{/if}
+
+{#if dialogMode === "delete" && selectedCheckpoint}
+  <div class="modal-backdrop" role="presentation">
+    <dialog open class="confirm-modal" aria-modal="true" aria-labelledby="delete-title">
+      <div class="modal-icon modal-icon-danger">!</div>
+      <h2 id="delete-title">删除这个存档点？</h2>
+      <p><strong>{checkpointLabel(selectedCheckpoint)}</strong> 将从保存记录中移除，此操作不能撤销。项目文件保持原样。当前版本、已有后续版本的存档和恢复安全点会受到保护。</p>
+      {#if errorMessage}<p class="modal-error" role="alert">{errorMessage}</p>{/if}
+      <div class="modal-actions">
+        <button class="button button-subtle" onclick={() => { selectedCheckpoint = null; dialogMode = null; }} disabled={loading}>取消</button>
+        <button class="button button-danger" onclick={deleteVersion} disabled={loading}>{loading ? "正在删除…" : "删除存档点"}</button>
+      </div>
+    </dialog>
+  </div>
+{/if}
+
+{#if dialogMode === "merge" && mergeSource}
+  <div class="modal-backdrop" role="presentation">
+    <dialog open class="confirm-modal" aria-modal="true" aria-labelledby="merge-title">
+      <div class="modal-icon"><svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="5" cy="4" r="2"/><circle cx="15" cy="4" r="2"/><circle cx="5" cy="16" r="2"/><path d="M5 6v8M15 6c0 5-10 1-10 6"/></svg></div>
+      <h2 id="merge-title">合并两个存档</h2>
+      <p>将 <strong>{checkpointLabel(mergeSource)}</strong> 的变化合入下面的版本，生成一个保留两条来源的新存档。当前文件保持原样；需要时再恢复到合并存档。有冲突时会停止合并。</p>
+      <label class="merge-field">合入版本
+        <select bind:value={mergeTargetId} disabled={loading}>
+          <option value="" disabled>选择另一个版本</option>
+          {#each mergeTargets as target (target.id)}<option value={target.id}>{checkpointLabel(target)} · {formatTime(target.createdAt)}</option>{/each}
+        </select>
+      </label>
+      <label class="merge-field">新存档说明<input bind:value={mergeLabel} maxlength="120" disabled={loading} /></label>
+      {#if errorMessage}<p class="modal-error" role="alert">{errorMessage}</p>{/if}
+      <div class="modal-actions">
+        <button class="button button-subtle" onclick={() => dialogMode = null} disabled={loading}>取消</button>
+        <button class="button button-primary" onclick={mergeVersions} disabled={loading || !mergeTargetId}>{loading ? "正在合并…" : "创建合并存档"}</button>
       </div>
     </dialog>
   </div>

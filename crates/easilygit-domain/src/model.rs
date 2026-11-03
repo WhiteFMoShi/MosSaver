@@ -58,8 +58,24 @@ pub struct Checkpoint {
     /// from. Native Git history entries leave this empty.
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// Additional source versions of a merge. The first parent remains the
+    /// comparison base for file changes and the main line in the graph.
+    #[serde(default)]
+    pub merge_parent_ids: Vec<String>,
     #[serde(default)]
     pub summary: Option<CheckpointSummary>,
+    /// Computed from the complete history when returning a page to the UI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_blocked_reason: Option<CheckpointDeleteBlock>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckpointDeleteBlock {
+    ReadOnly,
+    Current,
+    Recovery,
+    HasChildren,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +91,15 @@ pub enum CheckpointKind {
 pub struct ChangedFile {
     pub path: String,
     pub kind: ChangeKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FilePreview {
+    pub path: String,
+    pub patch: String,
+    pub unavailable_reason: Option<String>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -149,6 +149,43 @@ async fn list_managed_files(
 }
 
 #[tauri::command]
+async fn file_preview(
+    path: String,
+    checkpoint_id: String,
+    file_path: String,
+    service: State<'_, ProjectService<SystemGitBackend>>,
+) -> Result<easilygit_domain::FilePreview, CommandError> {
+    let service = service.inner().clone();
+    run_blocking(move || service.file_preview(&PathBuf::from(path), &checkpoint_id, &file_path))
+        .await
+}
+
+#[tauri::command]
+async fn delete_checkpoint(
+    path: String,
+    checkpoint_id: String,
+    service: State<'_, ProjectService<SystemGitBackend>>,
+) -> Result<ProjectState, CommandError> {
+    let service = service.inner().clone();
+    run_blocking(move || service.delete_checkpoint(&PathBuf::from(path), &checkpoint_id)).await
+}
+
+#[tauri::command]
+async fn merge_checkpoints(
+    path: String,
+    source_id: String,
+    target_id: String,
+    label: String,
+    service: State<'_, ProjectService<SystemGitBackend>>,
+) -> Result<ProjectState, CommandError> {
+    let service = service.inner().clone();
+    run_blocking(move || {
+        service.merge_checkpoints(&PathBuf::from(path), &source_id, &target_id, &label)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn set_file_managed(
     path: String,
     file_path: String,
@@ -466,6 +503,9 @@ pub fn run() {
             undo_restore,
             load_more_checkpoints,
             checkpoint_details,
+            file_preview,
+            delete_checkpoint,
+            merge_checkpoints,
             list_managed_files,
             set_file_managed,
             disable_protection,

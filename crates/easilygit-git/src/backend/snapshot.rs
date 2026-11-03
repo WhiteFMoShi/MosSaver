@@ -95,7 +95,9 @@ pub(super) fn write_checkpoint(
             CheckpointKind::User
         },
         parent_id,
+        merge_parent_ids: Vec::new(),
         summary: Some(summary),
+        delete_blocked_reason: None,
     };
     metadata.checkpoints.push(checkpoint.clone());
     metadata.current_checkpoint = Some(checkpoint.id.clone());

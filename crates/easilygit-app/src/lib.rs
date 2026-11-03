@@ -1,8 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 use easilygit_domain::{
-    AppError, AppResult, ChangedFile, Checkpoint, CheckpointDetails, CheckpointPage, ManagedFile,
-    ProjectOverview, ProjectState,
+    AppError, AppResult, ChangedFile, Checkpoint, CheckpointDetails, CheckpointPage, FilePreview,
+    ManagedFile, ProjectOverview, ProjectState,
 };
 
 const CHECKPOINT_PAGE_SIZE: usize = 50;
@@ -19,6 +22,15 @@ pub trait ProjectPort: Send + Sync + 'static {
         limit: usize,
     ) -> AppResult<CheckpointPage>;
     fn checkpoint_details(&self, root: &Path, id: &str) -> AppResult<CheckpointDetails>;
+    fn file_preview(&self, root: &Path, id: &str, file_path: &str) -> AppResult<FilePreview>;
+    fn delete_checkpoint(&self, root: &Path, id: &str) -> AppResult<()>;
+    fn merge_checkpoints(
+        &self,
+        root: &Path,
+        source: &str,
+        target: &str,
+        label: &str,
+    ) -> AppResult<()>;
     fn current_checkpoint_id(&self, root: &Path) -> AppResult<Option<String>>;
     fn has_user_checkpoint(&self, root: &Path) -> AppResult<bool>;
     fn create_checkpoint(&self, root: &Path, label: &str, automatic: bool)
@@ -34,20 +46,26 @@ pub trait ProjectPort: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct ProjectService<P> {
     port: P,
+    gate: Arc<Mutex<()>>,
 }
 
 impl<P: ProjectPort> ProjectService<P> {
     pub fn new(port: P) -> Self {
-        Self { port }
+        Self {
+            port,
+            gate: Arc::new(Mutex::new(())),
+        }
     }
 
     pub fn open_project(&self, path: &Path) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
         let selected = validate_folder(path)?;
         let root = self.port.repository_root(&selected)?.unwrap_or(selected);
         self.state_for_root(root)
     }
 
     pub fn project_overview(&self, path: &Path) -> AppResult<ProjectOverview> {
+        let _guard = self.lock()?;
         let selected = validate_folder(path)?;
         let repository_root = self.port.repository_root(&selected)?;
         let initialized = match &repository_root {
@@ -77,6 +95,7 @@ impl<P: ProjectPort> ProjectService<P> {
     }
 
     pub fn enable_protection(&self, path: &Path) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
         let selected = validate_folder(path)?;
         if self.port.repository_root(&selected)?.is_none() {
             self.port.initialize_repository(&selected)?;
@@ -93,42 +112,77 @@ impl<P: ProjectPort> ProjectService<P> {
     }
 
     pub fn refresh(&self, path: &Path) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
         let root = self.protected_root(path)?;
         self.state_for_root(root)
     }
 
     pub fn save_version(&self, path: &Path, label: &str) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
         let root = self.protected_root(path)?;
         self.port.create_checkpoint(&root, label, false)?;
         self.state_for_root(root)
     }
 
     pub fn restore(&self, path: &Path, id: &str) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
         let root = self.protected_root(path)?;
         self.port.restore_checkpoint(&root, id)?;
         self.state_for_root(root)
     }
 
     pub fn undo_restore(&self, path: &Path) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
         let root = self.protected_root(path)?;
         self.port.undo_restore(&root)?;
         self.state_for_root(root)
     }
 
     pub fn load_more_checkpoints(&self, path: &Path, offset: usize) -> AppResult<CheckpointPage> {
+        let _guard = self.lock()?;
         let root = self.protected_root(path)?;
         self.port
             .checkpoints_page(&root, offset, CHECKPOINT_PAGE_SIZE)
     }
 
     pub fn checkpoint_details(&self, path: &Path, id: &str) -> AppResult<CheckpointDetails> {
+        let _guard = self.lock()?;
         let root = self.protected_root(path)?;
         self.port.checkpoint_details(&root, id)
     }
 
     pub fn managed_files(&self, path: &Path) -> AppResult<Vec<ManagedFile>> {
+        let _guard = self.lock()?;
         let root = self.protected_root(path)?;
         self.port.managed_files(&root)
+    }
+
+    pub fn file_preview(&self, path: &Path, id: &str, file_path: &str) -> AppResult<FilePreview> {
+        let _guard = self.lock()?;
+        let root = self.protected_root(path)?;
+        self.port.file_preview(&root, id, file_path)
+    }
+
+    pub fn delete_checkpoint(&self, path: &Path, id: &str) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
+        let root = self.protected_root(path)?;
+        self.port.delete_checkpoint(&root, id)?;
+        self.state_for_root(root)
+    }
+
+    /// Merge two saved versions into a new saved version. The working folder,
+    /// active checkpoint, native Git branches and native index stay untouched.
+    pub fn merge_checkpoints(
+        &self,
+        path: &Path,
+        source: &str,
+        target: &str,
+        label: &str,
+    ) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
+        let root = self.protected_root(path)?;
+        self.port.merge_checkpoints(&root, source, target, label)?;
+        self.state_for_root(root)
     }
 
     pub fn set_file_managed(
@@ -137,15 +191,23 @@ impl<P: ProjectPort> ProjectService<P> {
         file_path: &str,
         managed: bool,
     ) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
         let root = self.protected_root(path)?;
         self.port.set_file_managed(&root, file_path, managed)?;
         self.state_for_root(root)
     }
 
     pub fn disable_protection(&self, path: &Path) -> AppResult<ProjectState> {
+        let _guard = self.lock()?;
         let root = self.protected_root(path)?;
         self.port.disable_protection(&root)?;
         self.state_for_root(root)
+    }
+
+    fn lock(&self) -> AppResult<MutexGuard<'_, ()>> {
+        self.gate
+            .lock()
+            .map_err(|_| AppError::Internal("Project service lock is unavailable".into()))
     }
 
     fn protected_root(&self, path: &Path) -> AppResult<PathBuf> {

@@ -151,7 +151,7 @@ pub(super) fn checkpoint_details_for_commit(
     Ok(CheckpointDetails { summary, files })
 }
 
-fn first_parent(
+pub(super) fn first_parent(
     root: &Path,
     commit: &str,
     environment: &[(std::ffi::OsString, std::ffi::OsString)],
@@ -294,7 +294,9 @@ fn parse_history_line(line: &[u8]) -> AppResult<Checkpoint> {
         created_at,
         kind: CheckpointKind::Git,
         parent_id: None,
+        merge_parent_ids: Vec::new(),
         summary: None,
+        delete_blocked_reason: None,
     })
 }
 

@@ -35,6 +35,98 @@ function assertNoFalseConnections(graph) {
   }
 }
 
+test("a merged version has both real parents and activates both source ancestries", () => {
+  const checkpoints = [
+    { ...checkpoint("merge", "right", "06:00"), mergeParentIds: ["left"] },
+    checkpoint("right", "root", "05:00"),
+    checkpoint("left", "root", "04:00"),
+    checkpoint("root", null, "01:00"),
+  ];
+  const { entries, graph } = graphFor(checkpoints, "merge", [CURRENT_FILES_ID]);
+  assert.ok(entries.every((entry) => entry.isActiveLineage));
+  for (const id of ["merge", "right", "root"]) assert.equal(entries.find((entry) => entry.checkpoint.id === id).lane, 0);
+  assert.ok(entries.find((entry) => entry.checkpoint.id === "left").lane > 0);
+  assert.deepEqual(graph.edges.map(({ fromId, toId }) => [fromId, toId]), [
+    ["merge", "right"], ["merge", "left"], ["right", "root"], ["left", "root"], [CURRENT_FILES_ID, "merge"],
+  ]);
+  assert.ok(graph.edges.every((edge) => edge.active));
+  assertNoFalseConnections(graph);
+});
+
+test("merge parents outside the loaded page do not produce invented nodes or edges", () => {
+  const { graph } = graphFor([
+    { ...checkpoint("merge", "right", "06:00"), mergeParentIds: ["unloaded"] },
+    checkpoint("right", null, "05:00"),
+  ], "merge");
+  assert.deepEqual(graph.edges.map(({ fromId, toId }) => [fromId, toId]), [["merge", "right"]]);
+  assert.equal(graph.nodes.length, 2);
+});
+
+test("repeated merges keep their exact parents after switching to either side", () => {
+  const checkpoints = [
+    { ...checkpoint("merge2", "next", "09:00"), mergeParentIds: ["third"] },
+    checkpoint("next", "merge1", "08:00"),
+    checkpoint("third", "root", "07:00"),
+    { ...checkpoint("merge1", "right", "06:00"), mergeParentIds: ["left"] },
+    checkpoint("right", "root", "05:00"),
+    checkpoint("left", "root", "04:00"),
+    checkpoint("root", null, "01:00"),
+  ];
+  for (const current of ["merge2", "merge1", "right", "left", "third", "root"]) {
+    const { entries, graph } = graphFor(checkpoints, current, [CURRENT_FILES_ID]);
+    assert.equal(entries.find((entry) => entry.checkpoint.id === current).lane, 0);
+    assertNoFalseConnections(graph);
+    for (const version of checkpoints) {
+      assert.deepEqual(graph.edges.filter((edge) => edge.fromId === version.id).map((edge) => edge.toId),
+        [version.parentId, ...(version.mergeParentIds ?? [])].filter(Boolean));
+    }
+    const active = new Set();
+    const pending = [current];
+    while (pending.length) {
+      const id = pending.pop();
+      if (active.has(id)) continue;
+      active.add(id);
+      const version = checkpoints.find((version) => version.id === id);
+      pending.push(...[version.parentId, ...(version.mergeParentIds ?? [])].filter(Boolean));
+    }
+    assert.deepEqual(new Set(entries.filter((entry) => entry.isActiveLineage).map((entry) => entry.checkpoint.id)), active);
+  }
+});
+
+test("100 reproducible merge graphs preserve all parents with clock changes and expanded rows", () => {
+  let seed = 20261104;
+  const random = (limit) => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed % limit;
+  };
+  for (let sample = 0; sample < 100; sample++) {
+    const checkpoints = Array.from({ length: 40 }, (_, index) => {
+      const parentIndex = index ? random(index) : -1;
+      const mergeIndex = index > 1 && random(3) === 0 ? random(index) : -1;
+      return {
+        id: `v${index}`, parentId: parentIndex >= 0 ? `v${parentIndex}` : null,
+        mergeParentIds: mergeIndex >= 0 && mergeIndex !== parentIndex ? [`v${mergeIndex}`] : [],
+        createdAt: new Date(1_700_000_000_000 + random(50) * 1000).toISOString(),
+      };
+    });
+    const currentId = `v${random(checkpoints.length)}`;
+    const entries = buildTimelineEntries(checkpoints, currentId);
+    let y = 30;
+    const centers = new Map([[CURRENT_FILES_ID, y]]);
+    for (const entry of entries) {
+      y += 98 + random(200);
+      centers.set(entry.checkpoint.id, y);
+    }
+    const graph = buildTimelineGraph(entries, centers, currentId, y + 98);
+    assertNoFalseConnections(graph);
+    assert.equal(graph.edges.length, checkpoints.reduce((count, version) => count + Number(Boolean(version.parentId)) + version.mergeParentIds.length, 1));
+    for (const version of checkpoints) {
+      assert.deepEqual(graph.edges.filter((edge) => edge.fromId === version.id).map((edge) => edge.toId),
+        [version.parentId, ...version.mergeParentIds].filter(Boolean));
+    }
+  }
+});
+
 test("01:19 has two children; 03:57 is never connected to 02:45", () => {
   const { graph, entries } = graphFor();
   assert.deepEqual(graph.edges.map(({ fromId, toId }) => [fromId, toId]), [
