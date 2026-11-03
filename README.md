@@ -78,6 +78,8 @@ git push origin v0.1.1
 
 The workflow checks that the tag matches the app version, then creates a draft GitHub Release with the installers, signatures, and updater manifest attached. Review it and publish it when ready; the in-app updater only sees published releases. Replace `0.1.1` with the next version. The version check runs in CI so mismatched Cargo, Tauri, and npm versions are caught before release. Windows SmartScreen and macOS Gatekeeper may show first-run warnings until code-signing certificates and notarization are configured.
 
+The tag must point to the commit that contains the matching version fields. If a tag was pushed before that commit, the release workflow will stop before building; move the tag to the corrected commit and push it again, or use a new version tag.
+
 The Rust workspace is divided by responsibility: `easilygit-domain` defines the data and errors, `easilygit-app` holds the user-facing workflows, `easilygit-git` performs local Git operations, and `apps/desktop/src-tauri` connects those workflows to the window. The Svelte UI is intentionally a small Vite app rather than a server-rendered web app.
 
 See [the architecture notes](docs/architecture.md) for the local storage and restore behavior.

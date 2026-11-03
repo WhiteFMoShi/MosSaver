@@ -12,12 +12,14 @@ jobs:
   verify-version:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
       - name: Check tag and application versions
-        run: node scripts/version.mjs check "${GITHUB_REF_NAME#v}"
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/version.mjs check-tag "$RELEASE_TAG"
 
   build:
     needs: verify-version
@@ -39,9 +41,9 @@ jobs:
             bundles: deb,rpm,appimage
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -66,7 +68,7 @@ jobs:
         working-directory: apps/desktop
 
       - name: Build installers and create draft release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}

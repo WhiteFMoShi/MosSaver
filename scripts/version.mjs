@@ -20,7 +20,11 @@ function isSemver(value) {
 }
 
 async function read(relativePath) {
-  return readFile(path.join(root, relativePath), 'utf8');
+  // Git checkouts on Windows can use CRLF even when the repository stores LF.
+  // Normalize text before applying the line-oriented checks below so the
+  // version check is independent of the runner's Git configuration.
+  const contents = await readFile(path.join(root, relativePath), 'utf8');
+  return contents.replace(/\r\n?/g, '\n');
 }
 
 async function write(relativePath, contents) {
@@ -124,6 +128,13 @@ async function checkVersion(expectedVersion) {
   console.log(`MosSaver version is consistent: ${[...distinctVersions][0]}.`);
 }
 
+async function checkTag(tag) {
+  if (!tag?.startsWith('v')) {
+    fail(`Invalid release tag: ${tag ?? '(missing)'}. Expected v<version>.`);
+  }
+  await checkVersion(tag.slice(1));
+}
+
 const [command, value, ...extra] = process.argv.slice(2);
 if (extra.length) fail('Too many arguments.');
 
@@ -133,6 +144,8 @@ if (command === 'set' && value) {
   await checkVersion();
 } else if (command === 'check') {
   await checkVersion(value);
+} else if (command === 'check-tag' && value) {
+  await checkTag(value);
 } else {
-  fail('Usage: node scripts/version.mjs set <x.y.z> | check [x.y.z]');
+  fail('Usage: node scripts/version.mjs set <x.y.z> | check [x.y.z] | check-tag v<x.y.z>');
 }

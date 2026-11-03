@@ -1,0 +1,7 @@
+# Keep source and configuration files stable across Windows, macOS, and Linux.
+* text=auto eol=lf
+
+# Image assets are binary and must never be rewritten by Git.
+*.icns binary
+*.ico binary
+*.png binary
