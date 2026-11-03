@@ -37,6 +37,45 @@ npm run check
 npm run build
 ```
 
+## Build and release installers
+
+Build an installer for the computer you are currently using:
+
+```sh
+cd apps/desktop
+npm ci
+npm run tauri build
+```
+
+Tauri writes platform-specific installers under `target/release/bundle/` at the repository root. Windows produces MSI and NSIS installers, macOS produces a DMG, and Linux can produce DEB, RPM, and AppImage packages. You need to build on each operating system; this command does not cross-compile Windows or macOS installers from another platform.
+
+The GitHub Release workflow builds Windows x64, macOS Intel and Apple silicon, and Linux x64 packages when a version tag is pushed. For the first build, the current version is `0.1.0`; check it, commit the release setup, then create and push the matching tag:
+
+```sh
+node scripts/version.mjs check
+git tag v0.1.0
+git push origin main
+git push origin v0.1.0
+```
+
+For later releases, update every app version field together, commit it, then create and push the matching tag:
+
+```sh
+cd apps/desktop
+npm run version:set -- 0.1.1
+npm run version:check
+```
+
+After committing the version update, from the repository root:
+
+```sh
+git tag v0.1.1
+git push origin main
+git push origin v0.1.1
+```
+
+The workflow checks that the tag matches the app version, then creates a draft GitHub Release with the installers attached. Review it and publish it when ready. Replace `0.1.1` with the next version. The version check runs in CI so mismatched Cargo, Tauri, and npm versions are caught before release. Releases are currently unsigned; Windows SmartScreen and macOS Gatekeeper may show first-run warnings until code-signing certificates and notarization are configured.
+
 The Rust workspace is divided by responsibility: `easilygit-domain` defines the data and errors, `easilygit-app` holds the user-facing workflows, `easilygit-git` performs local Git operations, and `apps/desktop/src-tauri` connects those workflows to the window. The Svelte UI is intentionally a small Vite app rather than a server-rendered web app.
 
 See [the architecture notes](docs/architecture.md) for the local storage and restore behavior.

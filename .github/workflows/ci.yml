@@ -20,6 +20,9 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
+      - name: Check application version consistency
+        run: node scripts/version.mjs check
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -42,6 +45,12 @@ jobs:
 
       - name: Test Rust
         run: cargo test --workspace
+        env:
+          # Integration tests compare exact fixture bytes. Windows runners may
+          # inherit core.autocrlf=true, which rewrites those fixtures to CRLF.
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: "false"
 
       - name: Install frontend dependencies
         run: npm ci
