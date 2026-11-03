@@ -177,11 +177,10 @@ pub(super) fn update_existing_history(root: &Path, metadata: &mut Metadata) -> A
         .current_checkpoint
         .as_deref()
         .is_some_and(|id| id.starts_with("git-"))
+        && let Some(checkpoint) = latest_mossaver_checkpoint(metadata)
     {
-        if let Some(checkpoint) = latest_mossaver_checkpoint(metadata) {
-            metadata.current_checkpoint = Some(checkpoint.id.clone());
-            changed = true;
-        }
+        metadata.current_checkpoint = Some(checkpoint.id.clone());
+        changed = true;
     }
     if !metadata.git_history_refs_cleaned {
         remove_legacy_git_references(root)?;

@@ -49,7 +49,9 @@ npm run tauri build
 
 Tauri writes platform-specific installers under `target/release/bundle/` at the repository root. Windows produces MSI and NSIS installers, macOS produces a DMG, and Linux can produce DEB, RPM, and AppImage packages. You need to build on each operating system; this command does not cross-compile Windows or macOS installers from another platform.
 
-The GitHub Release workflow builds Windows x64, macOS Intel and Apple silicon, and Linux x64 packages when a version tag is pushed. For the first build, the current version is `0.1.0`; check it, commit the release setup, then create and push the matching tag:
+The GitHub Release workflow builds Windows x64, macOS Intel and Apple silicon, and Linux x64 packages when a version tag is pushed. It also creates signed Tauri updater artifacts and publishes `latest.json`; MosSaver checks that manifest after startup and asks before downloading an update. Add the generated updater private key as the repository secret `TAURI_SIGNING_PRIVATE_KEY` (and add `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` when the key has a password). Keep the private key out of the repository. The updater public key is stored in `apps/desktop/src-tauri/tauri.conf.json`.
+
+For the first build, use the current version shown by `node scripts/version.mjs check`; commit the release setup, then create and push the matching tag:
 
 ```sh
 node scripts/version.mjs check
@@ -74,7 +76,7 @@ git push origin main
 git push origin v0.1.1
 ```
 
-The workflow checks that the tag matches the app version, then creates a draft GitHub Release with the installers attached. Review it and publish it when ready. Replace `0.1.1` with the next version. The version check runs in CI so mismatched Cargo, Tauri, and npm versions are caught before release. Releases are currently unsigned; Windows SmartScreen and macOS Gatekeeper may show first-run warnings until code-signing certificates and notarization are configured.
+The workflow checks that the tag matches the app version, then creates a draft GitHub Release with the installers, signatures, and updater manifest attached. Review it and publish it when ready; the in-app updater only sees published releases. Replace `0.1.1` with the next version. The version check runs in CI so mismatched Cargo, Tauri, and npm versions are caught before release. Windows SmartScreen and macOS Gatekeeper may show first-run warnings until code-signing certificates and notarization are configured.
 
 The Rust workspace is divided by responsibility: `easilygit-domain` defines the data and errors, `easilygit-app` holds the user-facing workflows, `easilygit-git` performs local Git operations, and `apps/desktop/src-tauri` connects those workflows to the window. The Svelte UI is intentionally a small Vite app rather than a server-rendered web app.
 

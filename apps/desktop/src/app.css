@@ -443,6 +443,15 @@ button:disabled { cursor: default !important; opacity: .55; }
 .merge-field input, .merge-field select { width: 100%; min-width: 0; min-height: 42px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--surface); color: var(--ink-strong); font: inherit; }
 .statusbar-notice { max-width: min(35vw, 450px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.update-backdrop { z-index: 20; }
+.update-modal { width: min(100%, 500px); }
+.update-icon { color: var(--green); background: var(--green-soft); }
+.update-icon svg { stroke-width: 1.7; }
+.update-notes { max-height: 180px; margin-top: 15px; padding: 11px 12px; overflow: auto; border-left: 2px solid var(--line-strong); color: var(--muted); background: var(--surface-muted); font-size: 14px; line-height: 1.6; white-space: pre-wrap; }
+.update-progress { height: 8px; margin-top: 22px; overflow: hidden; border-radius: 999px; background: var(--surface-muted); }
+.update-progress span { display: block; height: 100%; min-width: 2%; border-radius: inherit; background: var(--accent); transition: width .2s ease; }
+.update-progress-label { margin-top: 8px !important; color: var(--faint) !important; font-size: 13px !important; text-align: right; }
+
 .file-preview-trigger { display: block; width: 100%; flex-shrink: 0; padding: 5px 4px; border: 0; border-radius: 3px; background: transparent; text-align: left; cursor: pointer; font-size: 14px; }
 .file-preview-trigger:hover, .file-preview-trigger:focus-visible { color: var(--ink-strong); background: var(--surface-hover); outline: 1px solid var(--accent); outline-offset: -1px; }
 .diff-popover { position: fixed; z-index: 90; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface-raised); color: var(--ink); box-shadow: 0 12px 48px rgb(0 0 0 / 28%); }

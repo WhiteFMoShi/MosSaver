@@ -2,6 +2,8 @@
   import { listen } from "@tauri-apps/api/event";
   import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
+  import { relaunch } from "@tauri-apps/plugin-process";
+  import { check, type Update } from "@tauri-apps/plugin-updater";
   import { cubicOut } from "svelte/easing";
   import { onMount } from "svelte";
   import { fly } from "svelte/transition";
@@ -106,6 +108,11 @@
   let managedFiles = $state<ManagedFile[]>([]);
   let stopProtectionOpen = $state(false);
   let theme = $state<Theme>("light");
+  let availableUpdate = $state<Update | null>(null);
+  let updateChecking = $state(false);
+  let updateInstalling = $state(false);
+  let updateProgress = $state<number | null>(null);
+  let updateError = $state("");
   let loadedCheckpointCount = 0;
   let detailsRequest = 0;
   let autoRefreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -114,6 +121,8 @@
   const overviewTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const queuedOverviewPaths = new Set<string>();
   let overviewQueue = Promise.resolve();
+  let updateCheckTimer: ReturnType<typeof setTimeout> | undefined;
+  let updateNoticeTimer: ReturnType<typeof setTimeout> | undefined;
 
   onMount(() => {
     let disposed = false;
@@ -148,6 +157,9 @@
     };
     window.addEventListener("focus", refreshOnFocus);
     void loadManagedFolders();
+    updateCheckTimer = window.setTimeout(() => {
+      void checkForUpdate();
+    }, 1500);
 
     return () => {
       disposed = true;
@@ -155,6 +167,9 @@
       if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
       for (const timer of overviewTimers.values()) clearTimeout(timer);
       overviewTimers.clear();
+      if (updateCheckTimer) clearTimeout(updateCheckTimer);
+      if (updateNoticeTimer) clearTimeout(updateNoticeTimer);
+      void availableUpdate?.close().catch(() => {});
       unlisten?.();
       void invoke("stop_project_watch").catch(() => {});
       paneResizeCleanup?.();
@@ -682,6 +697,82 @@
     }
   }
 
+  function showUpdateNotice(message: string, duration = 4500) {
+    operationNotice = message;
+    if (updateNoticeTimer) clearTimeout(updateNoticeTimer);
+    if (duration > 0) {
+      updateNoticeTimer = window.setTimeout(() => {
+        updateNoticeTimer = undefined;
+        if (!availableUpdate && !updateInstalling) operationNotice = "";
+      }, duration);
+    }
+  }
+
+  async function checkForUpdate(manual = false) {
+    if (updateChecking || updateInstalling || availableUpdate) return;
+    updateChecking = true;
+    if (manual) showUpdateNotice("正在检查更新…", 0);
+    try {
+      const update = await check({ timeout: 8000 });
+      if (update) {
+        availableUpdate = update;
+        updateError = "";
+        updateProgress = null;
+        showUpdateNotice(`发现 MosSaver ${update.version} 更新`, 0);
+      } else if (manual) {
+        showUpdateNotice("已是最新版本");
+      }
+    } catch (error) {
+      if (manual) showUpdateNotice("暂时无法检查更新，请稍后再试");
+      console.warn("MosSaver update check failed", error);
+    } finally {
+      updateChecking = false;
+    }
+  }
+
+  async function installUpdate() {
+    const update = availableUpdate;
+    if (!update || updateInstalling) return;
+    updateInstalling = true;
+    updateError = "";
+    updateProgress = 0;
+    operationNotice = `正在下载 MosSaver ${update.version}…`;
+    try {
+      let downloaded = 0;
+      let total = 0;
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Started") {
+          total = event.data.contentLength ?? 0;
+          updateProgress = total > 0 ? 0 : null;
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+          updateProgress = total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : null;
+        } else if (event.event === "Finished") {
+          updateProgress = 100;
+        }
+      });
+      operationNotice = "更新已安装，正在重启 MosSaver…";
+      await relaunch();
+    } catch (error) {
+      updateError = "更新没有完成。请检查网络后重试，或稍后从 GitHub Release 手动安装。";
+      operationNotice = "更新失败";
+      console.warn("MosSaver update installation failed", error);
+    } finally {
+      updateInstalling = false;
+    }
+  }
+
+  async function dismissUpdate() {
+    if (updateInstalling) return;
+    const update = availableUpdate;
+    availableUpdate = null;
+    updateError = "";
+    updateProgress = null;
+    if (updateNoticeTimer) clearTimeout(updateNoticeTimer);
+    operationNotice = "";
+    await update?.close().catch(() => {});
+  }
+
   function friendlyError(error: unknown): string {
     if (error && typeof error === "object" && "code" in error) {
       const code = String(error.code);
@@ -1168,7 +1259,11 @@
     </div>
     <div class="statusbar-right">
       {#if operationNotice}<span class="statusbar-notice" title={operationNotice}>{operationNotice}</span>{/if}
-      {#if loading || refreshingFolders}
+      {#if updateChecking}
+        <span class="statusbar-state is-busy"><span class="statusbar-spinner"></span>正在检查更新…</span>
+      {:else if updateInstalling}
+        <span class="statusbar-state is-busy"><span class="statusbar-spinner"></span>正在更新…</span>
+      {:else if loading || refreshingFolders}
         <span class="statusbar-state is-busy"><span class="statusbar-spinner"></span>{loading ? "正在处理…" : "正在同步状态…"}</span>
       {:else if project?.initialized}
         <button class="statusbar-refresh" onclick={refreshProject} disabled={loading} title="刷新当前文件夹状态">
@@ -1304,6 +1399,30 @@
         <button class="button button-subtle" onclick={() => stopProtectionOpen = false} disabled={loading}>取消</button>
         <button class="button button-danger" onclick={stopProtection} disabled={loading}>停止保护并清理记录</button>
       </div>
+    </dialog>
+  </div>
+{/if}
+
+{#if availableUpdate}
+  <div class="modal-backdrop update-backdrop" role="presentation">
+    <dialog open class="confirm-modal update-modal" aria-modal="true" aria-labelledby="update-title" aria-describedby="update-description">
+      <div class="modal-icon update-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 15.5v2A2.5 2.5 0 0 0 7.5 20h9a2.5 2.5 0 0 0 2.5-2.5v-2" /></svg></div>
+      <h2 id="update-title">{updateInstalling ? "正在更新 MosSaver" : "发现新版本"}</h2>
+      {#if updateInstalling}
+        <p id="update-description">正在下载 MosSaver {availableUpdate.version}，完成后应用会自动重启。</p>
+        <div class="update-progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={updateProgress ?? undefined}>
+          <span style={`width: ${updateProgress ?? 30}%`}></span>
+        </div>
+        <p class="update-progress-label">{updateProgress === null ? "正在下载…" : `${updateProgress}%`}</p>
+      {:else}
+        <p id="update-description">当前版本 {availableUpdate.currentVersion}，可以更新到 MosSaver {availableUpdate.version}。</p>
+        {#if availableUpdate.body}<div class="update-notes">{availableUpdate.body}</div>{/if}
+        {#if updateError}<p class="modal-error" role="alert">{updateError}</p>{/if}
+        <div class="modal-actions">
+          <button class="button button-subtle" onclick={dismissUpdate}>稍后</button>
+          <button class="button button-primary" onclick={installUpdate}>{updateError ? "重试更新" : "立即更新"}</button>
+        </div>
+      {/if}
     </dialog>
   </div>
 {/if}
