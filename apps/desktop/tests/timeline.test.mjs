@@ -24,12 +24,88 @@ function pointOnSegment(point, from, to) {
     && point.y >= Math.min(from.y, to.y) && point.y <= Math.max(from.y, to.y);
 }
 function assertNoFalseConnections(graph) {
+  const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
   for (const edge of graph.edges) {
+    for (const [point, node] of [[edge.points[0], nodes.get(edge.fromId)], [edge.points.at(-1), nodes.get(edge.toId)]]) {
+      assert.deepEqual(point, { x: node.x, y: node.y }, `${edge.id} must end at its actual nodes`);
+    }
+    for (const point of edge.points) {
+      assert.ok(Number.isFinite(point.x) && Number.isFinite(point.y), `${edge.id} has finite coordinates`);
+      assert.ok(point.x >= 0 && point.x < graph.width && point.y >= 0 && point.y < graph.height,
+        `${edge.id} must fit inside the SVG`);
+    }
     for (const node of graph.nodes) {
       if (node.id === edge.fromId || node.id === edge.toId) continue;
       for (let index = 1; index < edge.points.length; index++) {
-        assert.equal(pointOnSegment(node, edge.points[index - 1], edge.points[index]), false,
+        const from = edge.points[index - 1];
+        const to = edge.points[index];
+        assert.equal(pointOnSegment(node, from, to), false,
           `${edge.id} must not pass through unrelated node ${node.id}`);
+        const dx = to.x - from.x;
+        const dy = to.y - from.y;
+        const t = Math.max(0, Math.min(1, ((node.x - from.x) * dx + (node.y - from.y) * dy) / (dx * dx + dy * dy)));
+        assert.ok(Math.hypot(node.x - from.x - t * dx, node.y - from.y - t * dy) >= 7,
+          `${edge.id} must leave space around unrelated node ${node.id}`);
+      }
+    }
+  }
+}
+
+function overlappingLength(left, right) {
+  let overlap = 0;
+  for (let i = 1; i < left.points.length; i++) {
+    const a = left.points[i - 1];
+    const b = left.points[i];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const length = Math.hypot(dx, dy);
+    for (let j = 1; j < right.points.length; j++) {
+      const c = right.points[j - 1];
+      const d = right.points[j];
+      if (Math.abs(dx * (c.y - a.y) - dy * (c.x - a.x)) > 0.001
+        || Math.abs(dx * (d.y - a.y) - dy * (d.x - a.x)) > 0.001) continue;
+      const first = ((c.x - a.x) * dx + (c.y - a.y) * dy) / length;
+      const last = ((d.x - a.x) * dx + (d.y - a.y) * dy) / length;
+      overlap += Math.max(0, Math.min(length, Math.max(first, last)) - Math.max(0, Math.min(first, last)));
+    }
+  }
+  return overlap;
+}
+
+// Sample the SVG itself as well as its routing polyline: rounding a safe
+// polyline must not make the visible curve clip an unrelated node.
+function renderedPoints(path) {
+  const tokens = path.split(/\s+/);
+  const points = [];
+  let current;
+  while (tokens.length) {
+    const command = tokens.shift();
+    const point = { x: Number(tokens.shift()), y: Number(tokens.shift()) };
+    if (command === "M") {
+      current = point;
+      points.push(point);
+      continue;
+    }
+    const end = command === "Q" ? { x: Number(tokens.shift()), y: Number(tokens.shift()) } : point;
+    for (let step = 1; step <= 50; step++) {
+      const t = step / 50;
+      points.push(command === "Q"
+        ? { x: (1 - t) ** 2 * current.x + 2 * (1 - t) * t * point.x + t ** 2 * end.x,
+          y: (1 - t) ** 2 * current.y + 2 * (1 - t) * t * point.y + t ** 2 * end.y }
+        : { x: current.x + (end.x - current.x) * t, y: current.y + (end.y - current.y) * t });
+    }
+    current = end;
+  }
+  return points;
+}
+
+function assertClearCurves(graph) {
+  for (const edge of graph.edges) {
+    for (const point of renderedPoints(edge.path)) {
+      for (const node of graph.nodes) {
+        if (node.id === edge.fromId || node.id === edge.toId) continue;
+        assert.ok(Math.hypot(node.x - point.x, node.y - point.y) >= 7,
+          `${edge.id}'s curve must leave clearance around ${node.id}`);
       }
     }
   }
@@ -52,12 +128,109 @@ test("a merged version has both real parents and activates both source ancestrie
   assert.ok(graph.edges.every((edge) => edge.active));
   const mergeEdge = graph.edges.find((edge) => edge.fromId === "merge" && edge.toId === "left");
   assert.equal(mergeEdge.kind, "merge");
-  assert.equal(mergeEdge.points.length, 2, "an unobstructed merge link should be a single straight line");
+  assert.equal(mergeEdge.points.length, 3, "a simple merge uses one compact turn onto its source's column");
+  assert.equal(mergeEdge.points[1].x, graph.nodes.find((node) => node.id === "left").x);
+  assert.match(mergeEdge.path, / Q /, "the turn is rounded rather than a square bracket");
+  for (const direct of graph.edges.filter((edge) => edge.kind !== "merge")) {
+    assert.equal(overlappingLength(mergeEdge, direct), 0, "a merge must not disappear into the direct parent trunk");
+  }
   assert.deepEqual(mergeEdge.points[0], { x: graph.nodes.find((node) => node.id === "merge").x,
     y: graph.nodes.find((node) => node.id === "merge").y });
   assert.deepEqual(mergeEdge.points.at(-1), { x: graph.nodes.find((node) => node.id === "left").x,
     y: graph.nodes.find((node) => node.id === "left").y });
   assertNoFalseConnections(graph);
+  assertClearCurves(graph);
+});
+
+function graphOnLanes(versions, selectedId = null) {
+  const checkpoints = versions.map(({ id, parentId = null, mergeParentIds = [] }, index) => ({
+    id, parentId, mergeParentIds, createdAt: new Date(1_700_000_000_000 - index * 1000).toISOString(),
+  }));
+  const entries = buildTimelineEntries(checkpoints, versions[0].id).map((entry) => ({
+    ...entry, lane: versions.find((version) => version.id === entry.checkpoint.id).lane,
+  }));
+  return buildTimelineGraph(entries, new Map(versions.map(({ id, y }) => [id, y])), versions[0].id,
+    Math.max(...versions.map(({ y }) => y)) + 98, selectedId);
+}
+
+test("a merge leaves the source column when an unrelated node blocks it", () => {
+  const graph = graphOnLanes([
+    { id: "merge", lane: 0, y: 30, parentId: "main", mergeParentIds: ["source"] },
+    { id: "main", lane: 0, y: 130, parentId: "root" },
+    { id: "blocker", lane: 2, y: 230, parentId: "root" },
+    { id: "other", lane: 1, y: 330, parentId: "root" },
+    { id: "source", lane: 2, y: 530, parentId: "root" },
+    { id: "root", lane: 0, y: 630 },
+  ]);
+  assertNoFalseConnections(graph);
+  assertClearCurves(graph);
+  const edge = graph.edges.find((edge) => edge.kind === "merge");
+  assert.ok(edge.points.slice(1, -1).every((point) => point.x !== 60),
+    "the long merge segment cannot use the blocked column");
+});
+
+test("concurrent merges to the same source have distinct tracks instead of a shared trunk", () => {
+  const versions = [
+    { id: "merge-a", lane: 0, y: 130, parentId: "main", mergeParentIds: ["source"] },
+    { id: "merge-b", lane: 1, y: 230, parentId: "root", mergeParentIds: ["source"] },
+    { id: "merge-c", lane: 3, y: 330, parentId: "root", mergeParentIds: ["source"] },
+    { id: "main", lane: 0, y: 530, parentId: "root" },
+    { id: "source", lane: 2, y: 630, parentId: "root" },
+    { id: "root", lane: 0, y: 730 },
+  ];
+  const graph = graphOnLanes(versions);
+  assertNoFalseConnections(graph);
+  assertClearCurves(graph);
+  const merges = graph.edges.filter((edge) => edge.kind === "merge");
+  assert.equal(merges.length, 3);
+  for (const merge of merges) {
+    for (const other of graph.edges) {
+      if (other.id !== merge.id) assert.equal(overlappingLength(merge, other), 0,
+        `${merge.id} and ${other.id} must stay independently traceable`);
+    }
+  }
+  for (const selectedId of versions.map(({ id }) => id)) {
+    const selectedGraph = graphOnLanes(versions, selectedId);
+    assert.deepEqual(selectedGraph.edges.map(({ points }) => points), graph.edges.map(({ points }) => points),
+      "selection must not move the connections the user is following");
+    assert.equal(selectedGraph.width, graph.width);
+  }
+});
+
+test("separate merges reuse local tracks without widening the graph on every save", () => {
+  const versions = Array.from({ length: 30 }, (_, index) => {
+    const y = 30 + index * 300;
+    return [
+      { id: `merge-${index}`, lane: 0, y, parentId: `main-${index}`, mergeParentIds: [`source-${index}`] },
+      { id: `main-${index}`, lane: 0, y: y + 100 },
+      { id: `source-${index}`, lane: 1, y: y + 200 },
+    ];
+  }).flat();
+  const graph = graphOnLanes(versions);
+  assertNoFalseConnections(graph);
+  assertClearCurves(graph);
+  assert.equal(graph.width, 76, "nonoverlapping merge routes do not need new outside tracks");
+  for (const merge of graph.edges.filter((edge) => edge.kind === "merge")) {
+    assert.ok(merge.points.every((point) => point.x >= 20 && point.x <= 40));
+  }
+});
+
+test("multiple source parents remain separate and rounded when time order is reversed", () => {
+  const graph = graphOnLanes([
+    { id: "parent", lane: 0, y: 30 },
+    { id: "source-a", lane: 1, y: 130 },
+    { id: "blocker", lane: 1, y: 230 },
+    { id: "source-b", lane: 2, y: 330 },
+    { id: "merge", lane: 0, y: 430, parentId: "parent", mergeParentIds: ["source-a", "source-b"] },
+  ]);
+  assertNoFalseConnections(graph);
+  assertClearCurves(graph);
+  assert.deepEqual(graph.edges.map(({ toId }) => toId), ["parent", "source-a", "source-b"]);
+  for (const edge of graph.edges) {
+    if (edge.kind === "merge") assert.match(edge.path, / Q /);
+    assert.ok(edge.points.slice(1).every((point, index) => point.y <= edge.points[index].y),
+      "a route must keep heading toward its real parent without doubling back");
+  }
 });
 
 test("selecting a merge highlights its exact parent paths without highlighting their ancestors", () => {
@@ -173,6 +346,7 @@ test("100 reproducible merge graphs preserve all parents with clock changes and 
     }
     const graph = buildTimelineGraph(entries, centers, currentId, y + 98);
     assertNoFalseConnections(graph);
+    if (sample < 10) assertClearCurves(graph);
     assert.equal(graph.edges.length, checkpoints.reduce((count, version) => count + Number(Boolean(version.parentId)) + version.mergeParentIds.length, 1));
     for (const version of checkpoints) {
       assert.deepEqual(graph.edges.filter((edge) => edge.fromId === version.id).map((edge) => edge.toId),

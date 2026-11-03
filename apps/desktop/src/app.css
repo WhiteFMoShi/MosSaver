@@ -25,6 +25,9 @@
   --green-soft: #def1e6;
   --amber: #9a6700;
   --amber-soft: #fff4ce;
+  --current: #a66a12;
+  --current-soft: #f7edcf;
+  --current-ink: #80500a;
   --red: #c72e0f;
   --red-soft: #fbe3de;
   --diff-added-bg: #d3edda;
@@ -61,6 +64,9 @@
   --green-soft: #303d31;
   --amber: #e5c07b;
   --amber-soft: #40392d;
+  --current: #e6b85c;
+  --current-soft: #433a2b;
+  --current-ink: #f2cb78;
   --red: #e06c75;
   --red-soft: #422f34;
   --diff-added-bg: #304936;
@@ -251,16 +257,18 @@ button:disabled { cursor: default !important; opacity: .55; }
 .timeline-graph-layer path.graph-edge-merge { stroke: var(--green); stroke-dasharray: 8 6; }
 .timeline-graph-layer path.graph-edge-selected { stroke: var(--accent); stroke-width: 3.2; }
 .timeline-graph-layer path.graph-edge-selected.graph-edge-merge { stroke-dasharray: 9 6; }
-.timeline-graph-layer path.graph-edge-context-dim { opacity: .2; }
-.timeline-graph-layer path.graph-edge-halo { stroke: var(--canvas); stroke-width: 5; }
+.timeline-graph-layer .graph-edge-context-dim { opacity: .2; }
+.timeline-graph-layer path.graph-edge-halo { stroke: var(--canvas); stroke-width: 6.5; }
 .timeline-graph-layer circle { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.6; }
 .timeline-graph-layer circle.graph-node-active { stroke: var(--accent); }
-.timeline-graph-layer circle.graph-node-current { stroke: var(--accent); stroke-width: 2; }
+.timeline-graph-layer circle.graph-node-current { stroke: var(--current); stroke-width: 2.8; }
 .timeline-graph-layer circle.graph-node-selection-halo { fill: color-mix(in srgb, var(--accent) 14%, transparent); stroke: none; }
 .timeline-graph-layer path.graph-node-selected { fill: var(--accent); stroke: var(--surface-raised); stroke-width: 2.5; stroke-linejoin: round; }
+.timeline-graph-layer path.graph-node-selected.graph-node-current { stroke: var(--current); stroke-width: 3; }
 .timeline-graph-layer circle.graph-node-related { stroke: var(--accent); stroke-width: 2.6; }
+.timeline-graph-layer circle.graph-node-current.graph-node-related { stroke: var(--current); stroke-width: 2.8; }
 .timeline-graph-layer circle.graph-node-context-dim { opacity: .28; }
-.timeline-graph-layer circle.graph-node-dot { fill: var(--accent); stroke: none; }
+.timeline-graph-layer circle.graph-node-dot { fill: var(--current); stroke: none; }
 .timeline-item { position: relative; z-index: 1; display: block; min-height: 98px; padding-left: max(96px, var(--timeline-graph-width, 96px)); }
 .timeline-content { min-width: 0; flex: 1; padding-bottom: 17px; }
 .timeline-title-row { display: flex; gap: 8px; align-items: center; }
@@ -268,7 +276,7 @@ button:disabled { cursor: default !important; opacity: .55; }
 .readonly-icon { display: inline-grid; width: 17px; height: 17px; flex: 0 0 auto; place-items: center; color: var(--faint); }
 .readonly-icon svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.35; }
 .readonly-icon:hover { color: var(--muted); }
-.latest-badge { flex: 0 0 auto; padding: 3px 6px; border-radius: 4px; color: var(--accent-ink); background: var(--accent-soft); font-size: 13px; }
+.latest-badge { flex: 0 0 auto; padding: 3px 7px; border-radius: 4px; color: var(--current-ink); background: var(--current-soft); font-size: 13px; font-weight: 650; }
 .timeline-time { margin: 5px 0 0; color: var(--faint); font-size: 13px; }
 .timeline-fork { display: inline-block; margin-top: 7px; padding: 3px 7px; border-radius: 4px; color: var(--accent-ink); background: var(--accent-soft); font-size: 13px; }
 .checkpoint-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 9px; color: var(--muted); font-size: 13px; }

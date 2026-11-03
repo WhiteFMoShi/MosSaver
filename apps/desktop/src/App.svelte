@@ -1002,19 +1002,19 @@
                     aria-hidden="true"
                   >
                     {#each timelineGraphEdges as edge (edge.id)}
-                      <path class="graph-edge-halo" d={edge.path}></path>
-                    {/each}
-                    {#each timelineGraphEdges as edge (edge.id)}
-                      <path class:graph-edge-active={edge.active} class:graph-edge-merge={edge.kind === "merge"}
-                        class:graph-edge-selected={edge.selected} class:graph-edge-context-dim={focusedCheckpointId !== null && !edge.selected} data-kind={edge.kind}
-                        data-from={edge.fromId} data-to={edge.toId} d={edge.path}></path>
+                      <g class:graph-edge-context-dim={focusedCheckpointId !== null && !edge.selected}>
+                        <path class="graph-edge-halo" d={edge.path}></path>
+                        <path class:graph-edge-active={edge.active} class:graph-edge-merge={edge.kind === "merge"}
+                          class:graph-edge-selected={edge.selected} data-kind={edge.kind}
+                          data-from={edge.fromId} data-to={edge.toId} d={edge.path}></path>
+                      </g>
                     {/each}
                     {#each timelineGraph.nodes as node (node.id)}
                       {#if focusedCheckpointId === node.id}
                         <circle class="graph-node-selection-halo" cx={node.x} cy={node.y} r="11"></circle>
                       {/if}
                       {#if focusedCheckpointId === node.id}
-                        <path class="graph-node-selected" d={`M ${node.x} ${node.y - 8} L ${node.x + 8} ${node.y} L ${node.x} ${node.y + 8} L ${node.x - 8} ${node.y} Z`} data-node-id={node.id}></path>
+                        <path class="graph-node-selected" class:graph-node-current={node.current} d={`M ${node.x} ${node.y - 8} L ${node.x + 8} ${node.y} L ${node.x} ${node.y + 8} L ${node.x - 8} ${node.y} Z`} data-node-id={node.id}></path>
                       {:else}
                       <circle
                         class:graph-node-active={node.active}
