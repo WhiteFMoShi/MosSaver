@@ -50,7 +50,61 @@ test("a merged version has both real parents and activates both source ancestrie
     ["merge", "right"], ["merge", "left"], ["right", "root"], ["left", "root"], [CURRENT_FILES_ID, "merge"],
   ]);
   assert.ok(graph.edges.every((edge) => edge.active));
+  const mergeEdge = graph.edges.find((edge) => edge.fromId === "merge" && edge.toId === "left");
+  assert.equal(mergeEdge.kind, "merge");
+  assert.equal(mergeEdge.points.length, 2, "an unobstructed merge link should be a single straight line");
+  assert.deepEqual(mergeEdge.points[0], { x: graph.nodes.find((node) => node.id === "merge").x,
+    y: graph.nodes.find((node) => node.id === "merge").y });
+  assert.deepEqual(mergeEdge.points.at(-1), { x: graph.nodes.find((node) => node.id === "left").x,
+    y: graph.nodes.find((node) => node.id === "left").y });
   assertNoFalseConnections(graph);
+});
+
+test("selecting a merge highlights its exact parent paths without highlighting their ancestors", () => {
+  const checkpoints = [
+    { ...checkpoint("merge", "right", "06:00"), mergeParentIds: ["left"] },
+    checkpoint("right", "root", "05:00"),
+    checkpoint("left", "root", "04:00"),
+    checkpoint("root", null, "01:00"),
+    checkpoint("unrelated", null, "00:30"),
+  ];
+  const entries = buildTimelineEntries(checkpoints, "merge");
+  const rows = new Map(entries.map((entry, index) => [entry.checkpoint.id, 30 + index * 100]));
+  const graph = buildTimelineGraph(entries, rows, "merge", 600, "merge");
+  assert.deepEqual(graph.edges.filter((edge) => edge.selected).map(({ fromId, toId, kind }) => [fromId, toId, kind]), [
+    ["merge", "right", "direct"], ["merge", "left", "merge"],
+  ]);
+  assert.deepEqual(graph.nodes.filter((node) => node.selected).map((node) => node.id), ["merge"]);
+  assert.deepEqual(graph.nodes.filter((node) => node.relatedToSelection).map((node) => node.id).sort(), ["left", "merge", "right"]);
+  assert.equal(graph.nodes.find((node) => node.id === "root").relatedToSelection, false);
+  assert.equal(graph.nodes.find((node) => node.id === "unrelated").relatedToSelection, false);
+});
+
+test("selecting either source parent highlights both sides of its merge relationship", () => {
+  const checkpoints = [
+    { ...checkpoint("merge", "right", "06:00"), mergeParentIds: ["left"] },
+    checkpoint("right", "root", "05:00"),
+    checkpoint("left", "root", "04:00"),
+    checkpoint("root", null, "01:00"),
+  ];
+  const entries = buildTimelineEntries(checkpoints, "merge");
+  const centers = new Map(entries.map((entry, index) => [entry.checkpoint.id, 30 + index * 100]));
+  const graph = buildTimelineGraph(entries, centers, "merge", 600, "left");
+  assert.deepEqual(graph.edges.filter((edge) => edge.selected && edge.fromId === "merge").map(({ fromId, toId }) => [fromId, toId]), [
+    ["merge", "right"], ["merge", "left"],
+  ]);
+  assert.equal(graph.nodes.find((node) => node.id === "merge").relatedToSelection, true);
+  assert.equal(graph.nodes.find((node) => node.id === "right").relatedToSelection, true);
+});
+
+test("selecting the current version also highlights its working-state connection", () => {
+  const entries = buildTimelineEntries(fork, "03:57");
+  const centers = new Map([[CURRENT_FILES_ID, 20], ...entries.map((entry, index) => [entry.checkpoint.id, 100 + index * 100])]);
+  const graph = buildTimelineGraph(entries, centers, "03:57", 600, "03:57");
+  assert.deepEqual(graph.edges.filter((edge) => edge.selected).map(({ fromId, toId, kind }) => [fromId, toId, kind]), [
+    ["03:57", "01:19", "direct"], [CURRENT_FILES_ID, "03:57", "working"],
+  ]);
+  assert.equal(graph.nodes.find((node) => node.id === CURRENT_FILES_ID).relatedToSelection, true);
 });
 
 test("merge parents outside the loaded page do not produce invented nodes or edges", () => {

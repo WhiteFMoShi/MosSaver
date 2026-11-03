@@ -99,6 +99,8 @@
   let changesPaneWidth = $state(340);
   let timelineHost = $state<HTMLOListElement | null>(null);
   let timelineGraph = $state<TimelineGraph>({ width: 96, height: 0, nodes: [], edges: [] });
+  const timelineGraphEdges = $derived([...timelineGraph.edges].sort((left, right) =>
+    Number(left.selected) - Number(right.selected) || Number(left.kind === "merge") - Number(right.kind === "merge")));
   let paneResizeCleanup: (() => void) | undefined;
   let managedFilesOpen = $state(false);
   let managedFiles = $state<ManagedFile[]>([]);
@@ -223,7 +225,7 @@
       scrollTop: host.scrollTop,
       clientHeight: host.clientHeight,
     }, measurements, Number.parseFloat(getComputedStyle(host).paddingBottom) || 0);
-    timelineGraph = buildTimelineGraph(timelineEntries, centers, project.currentCheckpointId, height);
+    timelineGraph = buildTimelineGraph(timelineEntries, centers, project.currentCheckpointId, height, focusedCheckpointId);
   }
 
   function applyTheme(nextTheme: Theme, persist = true) {
@@ -847,9 +849,7 @@
     <section class="home-view" in:fly={{ x: -14, duration: 230, easing: cubicOut }} out:fly={{ x: -10, duration: 150, easing: cubicOut }}>
       <div class="home-heading">
         <div>
-          <p class="eyebrow">你的工作空间</p>
           <h1>我的文件夹</h1>
-          <p class="home-subtitle">在这里查看项目变化，需要时一键保存或回到之前的版本。</p>
         </div>
         {#if managedPaths.length > 0}
           <div class="folder-total"><strong>{managedPaths.length}</strong><span>个文件夹</span></div>
@@ -893,7 +893,7 @@
             </article>
           {/each}
         </div>
-        <p class="list-footnote"><span class="privacy-dot"></span>移出列表不会删除文件，也不会关闭该文件夹的版本保护。</p>
+        <p class="list-footnote"><svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6"/><path d="M8 7.2v3.4M8 5.2h.01"/></svg><span>移出列表不会删除文件，也不会关闭该文件夹的版本保护。</span></p>
       {/if}
     </section>
   {:else}
@@ -979,7 +979,7 @@
 
           <section class="panel history-panel">
             <div class="panel-heading">
-              <div><h2>保存记录</h2><p>{draggedCheckpointId ? "拖到另一个节点合并，或拖到垃圾桶删除" : "点击节点操作 · 拖动节点合并 · Git 历史仅查看"}</p></div>
+              <div><h2>保存记录</h2><p>{#if draggedCheckpointId}拖到另一个节点合并，或拖到垃圾桶删除{:else}<span class="history-legend-item"><i class="history-legend-line"></i>直接来源</span><span class="history-legend-item"><i class="history-legend-line history-legend-merge"></i>合并来源</span>{/if}</p></div>
               {#if draggedCheckpointId}
                 <button class="node-trash-target icon-action" aria-label="拖到此处删除存档点" title="拖到此处删除存档点"
                   ondragover={(event) => { event.preventDefault(); if (event.dataTransfer) event.dataTransfer.dropEffect = "move"; }}
@@ -1001,21 +1001,33 @@
                     viewBox={`0 0 ${timelineGraph.width} ${timelineGraph.height}`}
                     aria-hidden="true"
                   >
-                    {#each timelineGraph.edges as edge (edge.id)}
+                    {#each timelineGraphEdges as edge (edge.id)}
                       <path class="graph-edge-halo" d={edge.path}></path>
-                      <path class:graph-edge-active={edge.active} data-from={edge.fromId} data-to={edge.toId} d={edge.path}></path>
+                    {/each}
+                    {#each timelineGraphEdges as edge (edge.id)}
+                      <path class:graph-edge-active={edge.active} class:graph-edge-merge={edge.kind === "merge"}
+                        class:graph-edge-selected={edge.selected} class:graph-edge-context-dim={focusedCheckpointId !== null && !edge.selected} data-kind={edge.kind}
+                        data-from={edge.fromId} data-to={edge.toId} d={edge.path}></path>
                     {/each}
                     {#each timelineGraph.nodes as node (node.id)}
+                      {#if focusedCheckpointId === node.id}
+                        <circle class="graph-node-selection-halo" cx={node.x} cy={node.y} r="11"></circle>
+                      {/if}
+                      {#if focusedCheckpointId === node.id}
+                        <path class="graph-node-selected" d={`M ${node.x} ${node.y - 8} L ${node.x + 8} ${node.y} L ${node.x} ${node.y + 8} L ${node.x - 8} ${node.y} Z`} data-node-id={node.id}></path>
+                      {:else}
                       <circle
                         class:graph-node-active={node.active}
                         class:graph-node-current={node.current}
-                        class:graph-node-selected={focusedCheckpointId === node.id}
+                        class:graph-node-related={node.relatedToSelection}
+                        class:graph-node-context-dim={focusedCheckpointId !== null && !node.relatedToSelection}
                         data-node-id={node.id}
                         cx={node.x}
                         cy={node.y}
-                        r={focusedCheckpointId === node.id ? 9 : node.current ? 6 : 5}
+                        r={node.current ? 6 : 5}
                       ></circle>
-                      {#if node.current}<circle class="graph-node-dot" cx={node.x} cy={node.y} r="2.2"></circle>{/if}
+                      {/if}
+                      {#if node.current && focusedCheckpointId !== node.id}<circle class="graph-node-dot" cx={node.x} cy={node.y} r="2.2"></circle>{/if}
                     {/each}
                   </svg>
                 {/if}
@@ -1061,8 +1073,13 @@
                           ondragend={endNodeDrag} ondragover={(event) => dragOverNode(event, checkpoint)}
                           ondragleave={() => dropCheckpointId = null} ondrop={(event) => dropOnNode(event, checkpoint)}
                           title={checkpoint.kind === "git" ? "选择版本" : "点击选择 · 拖动合并"}>{checkpointLabel(checkpoint)}</button></h3>
+                        {#if checkpoint.kind === "git"}
+                          <span class="readonly-icon" role="img" title="Git 提交，仅供查看" aria-label="Git 提交，仅供查看">
+                            <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="5.2" y="8.5" width="9.6" height="8" rx="1.5"/><path d="M7.2 8.5V6.7a2.8 2.8 0 0 1 5.6 0v1.8"/></svg>
+                          </span>
+                        {/if}
                         {#if isCurrentCheckpoint}<span class="latest-badge">{project.currentChanges.length > 0 ? "保存基准" : "当前"}</span>{/if}
-                        {#if checkpoint.mergeParentIds?.length}<span class="merge-badge" title="此存档保留了两条来源连线">合并</span>{/if}
+                        {#if checkpoint.mergeParentIds?.length}<span class="merge-badge" title="此存档连接了直接来源和合并来源">合并点</span>{/if}
                       </div>
                       {#if focusedCheckpointId === checkpoint.id && checkpoint.kind !== "git"}
                         <div class="node-actions" aria-label="版本操作">
@@ -1111,7 +1128,6 @@
                           {/each}
                         </div>
                       {/if}
-                      {#if checkpoint.kind === "git"}<span class="readonly-note">Git 提交 · 仅查看</span>{/if}
                       {#if checkpoint.kind === "automatic"}<span class="automatic-note">自动安全保存</span>{/if}
                     </div>
                   </li>
@@ -1124,7 +1140,14 @@
         </div>
 
         <footer class="local-footer">
-          <button class="stop-protection-link" onclick={() => stopProtectionOpen = true} disabled={loading}>停止此文件夹的保护</button>
+          <span class="protection-status">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5 16 5v4.8c0 3.5-2.4 6.1-6 7.7-3.6-1.6-6-4.2-6-7.7V5l6-2.5Z"/><path d="m7 9.8 2 2 4-4"/></svg>
+            <strong>此文件夹正在受保护</strong>
+          </span>
+          <button class="stop-protection-link" onclick={() => stopProtectionOpen = true} disabled={loading}>
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 5l10 10M15 5 5 15"/></svg>
+            停止保护
+          </button>
         </footer>
       {/if}
     </section>

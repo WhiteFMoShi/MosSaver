@@ -22,6 +22,8 @@ export interface TimelineGraphNode extends GraphPoint {
   id: string;
   active: boolean;
   current: boolean;
+  selected: boolean;
+  relatedToSelection: boolean;
 }
 
 export interface TimelineGraphEdge {
@@ -31,6 +33,8 @@ export interface TimelineGraphEdge {
   points: GraphPoint[];
   path: string;
   active: boolean;
+  kind: "direct" | "merge" | "working";
+  selected: boolean;
 }
 
 export interface TimelineGraph {
@@ -228,6 +232,7 @@ export function buildTimelineGraph(
   rowCenters: ReadonlyMap<string, number>,
   currentCheckpointId: string | null,
   height: number,
+  selectedCheckpointId: string | null = null,
 ): TimelineGraph {
   const entryById = new Map(entries.map((entry) => [entry.checkpoint.id, entry]));
   const nodes: TimelineGraphNode[] = [];
@@ -238,7 +243,8 @@ export function buildTimelineGraph(
   let maxX = nodeX(maxLane);
   const currentY = rowCenters.get(CURRENT_FILES_ID);
   if (currentY !== undefined) {
-    nodes.push({ id: CURRENT_FILES_ID, x: nodeX(0), y: currentY, active: true, current: true });
+    nodes.push({ id: CURRENT_FILES_ID, x: nodeX(0), y: currentY, active: true, current: true,
+      selected: false, relatedToSelection: false });
   }
   for (const entry of entries) {
     const y = rowCenters.get(entry.checkpoint.id);
@@ -249,6 +255,8 @@ export function buildTimelineGraph(
       y,
       active: entry.isActiveLineage,
       current: entry.checkpoint.id === currentCheckpointId,
+      selected: false,
+      relatedToSelection: false,
     });
   }
   const nodeById = new Map(nodes.map((node) => [node.id, node]));
@@ -259,6 +267,20 @@ export function buildTimelineGraph(
     ysByX.set(node.x, ys);
   }
   for (const ys of ysByX.values()) ys.sort((left, right) => left - right);
+  function hasNodeNearSegment(from: GraphPoint, to: GraphPoint): boolean {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const lengthSquared = dx * dx + dy * dy;
+    if (lengthSquared === 0) return false;
+    return nodes.some((node) => {
+      if ((node.x === from.x && node.y === from.y) || (node.x === to.x && node.y === to.y)) return false;
+      const projection = ((node.x - from.x) * dx + (node.y - from.y) * dy) / lengthSquared;
+      if (projection <= 0 || projection >= 1) return false;
+      const nearestX = from.x + projection * dx;
+      const nearestY = from.y + projection * dy;
+      return (node.x - nearestX) ** 2 + (node.y - nearestY) ** 2 <= 36;
+    });
+  }
   function hasIntermediateNode(x: number, firstY: number, lastY: number): boolean {
     const ys = ysByX.get(x) ?? [];
     const minY = Math.min(firstY, lastY) + 0.001;
@@ -272,7 +294,12 @@ export function buildTimelineGraph(
     }
     return low < ys.length && ys[low] <= maxY;
   }
-  function connect(fromId: string, toId: string, active: boolean) {
+  function connect(
+    fromId: string,
+    toId: string,
+    active: boolean,
+    kind: TimelineGraphEdge["kind"],
+  ) {
     const from = nodeById.get(fromId);
     const to = nodeById.get(toId);
     if (!from || !to) return;
@@ -281,7 +308,10 @@ export function buildTimelineGraph(
     const start = { x: from.x, y: from.y };
     const end = { x: to.x, y: to.y };
     let points: GraphPoint[];
-    if (hasIntermediateNode(from.x, from.y, from.x === to.x ? to.y : joinY)) {
+    if (kind === "merge" && !hasNodeNearSegment(start, end)) {
+      // Show an unobstructed secondary-parent link as a single, direct line.
+      points = [start, end];
+    } else if (hasIntermediateNode(from.x, from.y, from.x === to.x ? to.y : joinY)) {
       // A clock change can put an ancestor between a child and its parent in
       // time order. Detour rather than visually claiming it is another parent.
       maxX += 20;
@@ -294,23 +324,47 @@ export function buildTimelineGraph(
       points = [start, { x: from.x, y: joinY }, end];
     }
     edges.push({
-      id: `${fromId}->${toId}`, fromId, toId, active, points,
+      id: `${fromId}->${toId}`, fromId, toId, active, kind, selected: false, points,
       path: points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`).join(" "),
     });
   }
   for (const entry of entries) {
     if (entry.parent) {
       connect(entry.checkpoint.id, entry.parent.id,
-        entry.isActiveLineage && Boolean(entryById.get(entry.parent.id)?.isActiveLineage));
+        entry.isActiveLineage && Boolean(entryById.get(entry.parent.id)?.isActiveLineage), "direct");
     }
     for (const parentId of entry.checkpoint.mergeParentIds ?? []) {
       if (parentId !== entry.checkpoint.parentId) {
         connect(entry.checkpoint.id, parentId,
-          entry.isActiveLineage && Boolean(entryById.get(parentId)?.isActiveLineage));
+          entry.isActiveLineage && Boolean(entryById.get(parentId)?.isActiveLineage), "merge");
       }
     }
   }
-  if (currentCheckpointId) connect(CURRENT_FILES_ID, currentCheckpointId, true);
+  if (currentCheckpointId) connect(CURRENT_FILES_ID, currentCheckpointId, true, "working");
+  const mergeChildren = new Set(edges.filter((edge) => edge.kind === "merge").map((edge) => edge.fromId));
+  const relatedMergeChildren = new Set(edges.filter((edge) => edge.kind !== "working"
+    && mergeChildren.has(edge.fromId)
+    && (edge.fromId === selectedCheckpointId || edge.toId === selectedCheckpointId))
+    .map((edge) => edge.fromId));
+  for (const edge of edges) {
+    const touchesSelection = selectedCheckpointId && (
+      (edge.kind === "working" && edge.toId === selectedCheckpointId)
+      || (edge.kind !== "working" && (edge.fromId === selectedCheckpointId || edge.toId === selectedCheckpointId))
+    );
+    edge.selected = Boolean(touchesSelection || (edge.kind !== "working" && relatedMergeChildren.has(edge.fromId)));
+  }
+  const relatedIds = new Set<string>();
+  for (const edge of edges) {
+    if (edge.selected) {
+      relatedIds.add(edge.fromId);
+      relatedIds.add(edge.toId);
+    }
+  }
+  if (selectedCheckpointId) relatedIds.add(selectedCheckpointId);
+  for (const node of nodes) {
+    node.selected = node.id === selectedCheckpointId;
+    node.relatedToSelection = relatedIds.has(node.id);
+  }
   return {
     width: Math.max(76, maxX + 20),
     height, nodes, edges,
