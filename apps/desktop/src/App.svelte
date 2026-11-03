@@ -5,6 +5,13 @@
   import { cubicOut } from "svelte/easing";
   import { onMount } from "svelte";
   import { fly } from "svelte/transition";
+  import {
+    buildTimelineEntries,
+    buildTimelineGraph,
+    CURRENT_FILES_ID,
+    measureTimelineRows,
+    type TimelineGraph,
+  } from "./lib/timeline";
 
   type ChangeKind = "added" | "modified" | "deleted";
   type Theme = "light" | "dark";
@@ -33,14 +40,6 @@
   interface CheckpointDetails {
     summary: CheckpointSummary;
     files: ChangedFile[];
-  }
-
-  interface TimelineEntry {
-    checkpoint: Checkpoint;
-    lane: number;
-    parent: Checkpoint | null;
-    hasSibling: boolean;
-    isActiveLineage: boolean;
   }
 
   interface CheckpointPage {
@@ -88,6 +87,8 @@
   let expandedCheckpointId = $state<string | null>(null);
   let loadingCheckpointId = $state<string | null>(null);
   let changesPaneWidth = $state(340);
+  let timelineHost = $state<HTMLOListElement | null>(null);
+  let timelineGraph = $state<TimelineGraph>({ width: 96, height: 0, nodes: [], edges: [] });
   let paneResizeCleanup: (() => void) | undefined;
   let managedFilesOpen = $state(false);
   let managedFiles = $state<ManagedFile[]>([]);
@@ -167,73 +168,49 @@
   const showCurrentFilesNode = $derived(
     Boolean(project && (project.currentChanges.length > 0 || !currentCheckpointVisible)),
   );
-  const timelineEntries = $derived.by((): TimelineEntry[] => {
-    if (!project) return [];
-    const checkpoints = project.checkpoints;
-    const byId = new Map(checkpoints.map((checkpoint) => [checkpoint.id, checkpoint]));
-    const children = new Map<string, Checkpoint[]>();
-    for (const checkpoint of checkpoints) {
-      if (checkpoint.parentId && byId.has(checkpoint.parentId)) {
-        const siblings = children.get(checkpoint.parentId) ?? [];
-        siblings.push(checkpoint);
-        children.set(checkpoint.parentId, siblings);
-      }
-    }
-    // Follow the selected version's ancestry on the main lane. Other children
-    // of a fork get their own lanes, so the visible graph follows the branch
-    // the user is currently working on instead of guessing from timestamps.
-    const sortOldest = (left: Checkpoint, right: Checkpoint) =>
-      left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
-    for (const siblings of children.values()) siblings.sort(sortOldest);
-    const activePath = new Set<string>();
-    let active = byId.get(project.currentCheckpointId ?? "");
-    while (active && !activePath.has(active.id)) {
-      activePath.add(active.id);
-      active = active.parentId ? byId.get(active.parentId) : undefined;
-    }
-    const laneById = new Map<string, number>();
-    const siblingById = new Set<string>();
-    const orderedIds: string[] = [];
-    let nextLane = 1;
-    const visited = new Set<string>();
-    const visit = (checkpoint: Checkpoint, lane: number) => {
-      if (visited.has(checkpoint.id)) return;
-      visited.add(checkpoint.id);
-      orderedIds.push(checkpoint.id);
-      laneById.set(checkpoint.id, lane);
-      const childList = children.get(checkpoint.id) ?? [];
-      if (childList.length > 1) {
-        for (const child of childList) siblingById.add(child.id);
-      }
-      const mainChild = childList.find((child) => activePath.has(child.id)) ?? childList[0];
-      const orderedChildren = mainChild
-        ? [mainChild, ...childList.filter((child) => child !== mainChild)]
-        : childList;
-      for (const child of orderedChildren) {
-        const isMainChild = child === mainChild;
-        const childLane = isMainChild ? lane : nextLane++;
-        visit(child, childLane);
-      }
-    };
-    // A checkpoint whose parent is not loaded is a root for this page. It is
-    // still rendered, but cannot distort lanes belonging to known parents.
-    const oldestFirst = [...checkpoints].sort(
-      (left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
-    );
-    for (const checkpoint of oldestFirst) {
-      if (!checkpoint.parentId || !byId.has(checkpoint.parentId)) visit(checkpoint, 0);
-    }
-    for (const checkpoint of oldestFirst) visit(checkpoint, 0);
-    return orderedIds
-      .map((id) => byId.get(id)!)
-      .map((checkpoint) => ({
-        checkpoint,
-        lane: laneById.get(checkpoint.id) ?? 0,
-        parent: checkpoint.parentId ? byId.get(checkpoint.parentId) ?? null : null,
-        hasSibling: siblingById.has(checkpoint.id),
-        isActiveLineage: activePath.has(checkpoint.id),
-      }));
+  const timelineEntries = $derived(
+    buildTimelineEntries(project?.checkpoints ?? [], project?.currentCheckpointId ?? null),
+  );
+
+  $effect(() => {
+    timelineEntries;
+    showCurrentFilesNode;
+    expandedCheckpointId;
+    if (!timelineHost) return;
+    const frame = requestAnimationFrame(measureTimelineGraph);
+    return () => cancelAnimationFrame(frame);
   });
+
+  $effect(() => {
+    if (!timelineHost) return;
+    const observer = new ResizeObserver(() => measureTimelineGraph());
+    observer.observe(timelineHost);
+    return () => observer.disconnect();
+  });
+
+  function measureTimelineGraph() {
+    const host = timelineHost;
+    if (!host || !project) return;
+    const rows = [...host.querySelectorAll<HTMLElement>("[data-timeline-row]")];
+    const measurements = rows.map((row) => {
+      const rect = row.getBoundingClientRect();
+      const anchor = row.querySelector<HTMLElement>("[data-timeline-anchor]")?.getBoundingClientRect() ?? rect;
+      return {
+        id: row.dataset.timelineRow!,
+        top: rect.top,
+        height: rect.height,
+        anchorTop: anchor.top,
+        anchorHeight: anchor.height,
+      };
+    });
+    const { centers, height } = measureTimelineRows({
+      top: host.getBoundingClientRect().top,
+      clientTop: host.clientTop,
+      scrollTop: host.scrollTop,
+      clientHeight: host.clientHeight,
+    }, measurements, Number.parseFloat(getComputedStyle(host).paddingBottom) || 0);
+    timelineGraph = buildTimelineGraph(timelineEntries, centers, project.currentCheckpointId, height);
+  }
 
   function applyTheme(nextTheme: Theme, persist = true) {
     theme = nextTheme;
@@ -876,12 +853,37 @@
             {#if project.checkpoints.length === 0}
               <div class="empty-panel"><span class="history-empty-icon">◷</span><strong>还没有保存记录</strong><span>保存当前版本，为项目留下一个安全点。</span></div>
             {:else}
-              <ol class="timeline">
+              <div class="timeline-scroll">
+              <ol class="timeline" bind:this={timelineHost} style={`--timeline-graph-width: ${timelineGraph.width}px`}>
+                {#if timelineGraph.height > 0}
+                  <svg
+                    class="timeline-graph-layer"
+                    width={timelineGraph.width}
+                    height={timelineGraph.height}
+                    viewBox={`0 0 ${timelineGraph.width} ${timelineGraph.height}`}
+                    aria-hidden="true"
+                  >
+                    {#each timelineGraph.edges as edge (edge.id)}
+                      <path class="graph-edge-halo" d={edge.path}></path>
+                      <path class:graph-edge-active={edge.active} data-from={edge.fromId} data-to={edge.toId} d={edge.path}></path>
+                    {/each}
+                    {#each timelineGraph.nodes as node (node.id)}
+                      <circle
+                        class:graph-node-active={node.active}
+                        class:graph-node-current={node.current}
+                        data-node-id={node.id}
+                        cx={node.x}
+                        cy={node.y}
+                        r={node.current ? 6 : 5}
+                      ></circle>
+                      {#if node.current}<circle class="graph-node-dot" cx={node.x} cy={node.y} r="2.2"></circle>{/if}
+                    {/each}
+                  </svg>
+                {/if}
                 {#if showCurrentFilesNode}
-                  <li class="timeline-item current-files-item">
-                    <span class="timeline-marker current-files-marker"><span></span></span>
+                  <li class="timeline-item current-files-item" data-timeline-row={CURRENT_FILES_ID}>
                     <div class="timeline-content">
-                      <div class="timeline-title-row">
+                      <div class="timeline-title-row" data-timeline-anchor>
                         <h3>当前文件</h3>
                         <span class="latest-badge">当前</span>
                       </div>
@@ -896,12 +898,9 @@
                 {#each timelineEntries as entry (entry.checkpoint.id)}
                   {@const checkpoint = entry.checkpoint}
                   {@const isCurrentCheckpoint = checkpoint.id === project.currentCheckpointId}
-                  <li class:current-checkpoint={isCurrentCheckpoint} class:timeline-branch={entry.hasSibling} class:active-lineage={entry.isActiveLineage} class="timeline-item">
-                    <span class="timeline-graph" style={`--branch-offset: ${entry.lane * 20}px`} aria-hidden="true">
-                      <span class="timeline-marker">{#if isCurrentCheckpoint}<span></span>{/if}</span>
-                    </span>
+                  <li class:current-checkpoint={isCurrentCheckpoint} class:timeline-branch={entry.hasSibling} class:active-lineage={entry.isActiveLineage} class="timeline-item" data-timeline-row={checkpoint.id}>
                     <div class="timeline-content">
-                      <div class="timeline-title-row">
+                      <div class="timeline-title-row" data-timeline-anchor>
                         <h3>{checkpointLabel(checkpoint)}</h3>
                         {#if isCurrentCheckpoint}<span class="latest-badge">{project.currentChanges.length > 0 ? "保存基准" : "当前"}</span>{/if}
                       </div>
@@ -948,6 +947,7 @@
                   </li>
                 {/each}
               </ol>
+              </div>
               {#if project.hasMoreCheckpoints}<button class="load-more-button" onclick={loadMoreCheckpoints} disabled={loading}>加载更早的记录</button>{/if}
             {/if}
           </section>

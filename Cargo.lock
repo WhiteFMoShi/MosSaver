@@ -715,6 +715,7 @@ dependencies = [
 name = "easilygit-git"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "easilygit-app",
  "easilygit-domain",
  "serde",

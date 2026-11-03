@@ -213,23 +213,33 @@ fn valid_visible_checkpoints(
         .map(|(position, id)| (id.as_str(), position))
         .collect();
     let mut checkpoints = Vec::new();
-    for checkpoint in &metadata.checkpoints {
+    for (position, checkpoint) in metadata.checkpoints.iter().enumerate() {
         if checkpoint.kind != CheckpointKind::Automatic
             && (checkpoint.kind == CheckpointKind::Git || references.contains(&checkpoint.id))
         {
-            checkpoints.push(checkpoint.clone());
+            let timestamp = chrono::DateTime::parse_from_rfc3339(&checkpoint.created_at).ok();
+            let is_git = checkpoint.kind == CheckpointKind::Git;
+            // MosSaver metadata is append-only in save order. Git timestamps
+            // have second precision, so IDs are not a valid tie-breaker. For
+            // read-only Git ties, keep the order returned by git log.
+            let tie_order = if is_git {
+                history_order
+                    .get(checkpoint.id.as_str())
+                    .copied()
+                    .unwrap_or(position)
+            } else {
+                usize::MAX - position
+            };
+            checkpoints.push((timestamp, is_git, tie_order, checkpoint));
         }
     }
-    checkpoints.sort_by(|left, right| {
-        if left.kind == CheckpointKind::Git && right.kind == CheckpointKind::Git {
-            return history_order
-                .get(left.id.as_str())
-                .cmp(&history_order.get(right.id.as_str()));
-        }
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| right.id.cmp(&left.id))
+    // Use one total ordering for mixed MosSaver/Git pages. Switching between
+    // history rank and timestamp inside a comparator can be non-transitive.
+    checkpoints.sort_by_key(|(timestamp, is_git, tie_order, _)| {
+        (std::cmp::Reverse(*timestamp), *is_git, *tie_order)
     });
-    Ok(checkpoints)
+    Ok(checkpoints
+        .into_iter()
+        .map(|(_, _, _, checkpoint)| checkpoint.clone())
+        .collect())
 }

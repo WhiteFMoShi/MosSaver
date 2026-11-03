@@ -319,6 +319,86 @@ fn older_mossaver_versions_are_hydrated_with_their_real_parent_links() {
 }
 
 #[test]
+fn same_second_saves_keep_save_order_on_refresh_and_across_pages() {
+    use easilygit_app::ProjectPort;
+
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "initial\n").unwrap();
+    let service = ProjectService::new(SystemGitBackend);
+    service.enable_protection(root).unwrap();
+    for index in 1..=5 {
+        fs::write(root.join("notes.txt"), format!("save {index}\n")).unwrap();
+        service
+            .save_version(root, &format!("save {index}"))
+            .unwrap();
+    }
+
+    let metadata_path = root.join(".git/easilygit/metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    for checkpoint in metadata["checkpoints"].as_array_mut().unwrap() {
+        checkpoint["createdAt"] = "2026-11-03T01:19:00+08:00".into();
+    }
+    let expected: Vec<String> = metadata["checkpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|checkpoint| checkpoint["id"].as_str().unwrap().to_owned())
+        .collect();
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    let refreshed = service.refresh(root).unwrap();
+    assert_eq!(
+        refreshed
+            .checkpoints
+            .iter()
+            .map(|checkpoint| &checkpoint.id)
+            .collect::<Vec<_>>(),
+        expected.iter().collect::<Vec<_>>()
+    );
+    let mut paged_ids = Vec::new();
+    for offset in [0, 2, 4] {
+        let page = SystemGitBackend.checkpoints_page(root, offset, 2).unwrap();
+        assert_eq!(page.has_more, offset < 4);
+        paged_ids.extend(page.checkpoints.into_iter().map(|checkpoint| checkpoint.id));
+    }
+    assert_eq!(paged_ids, expected);
+}
+
+#[test]
+fn version_pages_compare_timezone_offsets_as_instants() {
+    let directory = tempdir().unwrap();
+    let root = directory.path();
+    fs::write(root.join("notes.txt"), "initial\n").unwrap();
+    let service = ProjectService::new(SystemGitBackend);
+    service.enable_protection(root).unwrap();
+    fs::write(root.join("notes.txt"), "later\n").unwrap();
+    service.save_version(root, "later").unwrap();
+
+    let metadata_path = root.join(".git/easilygit/metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+    let checkpoints = metadata["checkpoints"].as_array_mut().unwrap();
+    checkpoints[0]["createdAt"] = "2026-11-03T12:00:00+08:00".into();
+    checkpoints[1]["createdAt"] = "2026-11-03T05:00:00Z".into();
+    fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    let refreshed = service.refresh(root).unwrap();
+    assert_eq!(refreshed.checkpoints[0].label, "later");
+    assert_eq!(refreshed.checkpoints[1].label, "开始使用 MosSaver");
+}
+
+#[test]
 fn an_existing_git_repository_requires_an_explicit_start() {
     let directory = tempdir().unwrap();
     let root = directory.path();

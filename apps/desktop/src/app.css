@@ -233,19 +233,17 @@ button:disabled { cursor: default !important; opacity: .55; }
 .label-added, .legend-added { color: var(--green); }.label-modified, .legend-modified { color: var(--amber); }.label-deleted, .legend-deleted { color: var(--red); }
 .change-legend { display: flex; flex-wrap: wrap; gap: 13px; padding: 11px 15px; border-top: 1px solid var(--line); color: var(--muted); font-size: 14px; }
 
-.timeline { min-height: 0; flex: 1 1 auto; overflow: auto; overscroll-behavior: contain; margin: 0; padding: 14px 17px 4px; list-style: none; }
-.timeline-item { position: relative; display: flex; gap: 12px; min-height: 98px; }
-.timeline-item:not(:last-child)::before { display: none; }
-.timeline-graph { position: relative; display: block; width: calc(13px + var(--branch-offset, 0px)); min-width: calc(13px + var(--branch-offset, 0px)); align-self: stretch; }
-.timeline-graph::before { position: absolute; top: -14px; bottom: -18px; left: calc(6px + var(--branch-offset, 0px)); border-left: 1px solid var(--line-strong); content: ""; opacity: .7; }
-.timeline-graph::after { position: absolute; top: 9px; left: 6px; width: var(--branch-offset, 0px); border-top: 1px solid var(--line-strong); content: ""; opacity: .7; }
-.timeline-item:first-child .timeline-graph::before { top: 9px; }
-.timeline-item:last-child .timeline-graph::before { bottom: auto; height: 9px; }
-.timeline-item.active-lineage .timeline-graph::before, .timeline-item.active-lineage .timeline-graph::after { border-color: var(--accent); opacity: .76; }
-.timeline-graph > .timeline-marker { position: absolute; z-index: 1; top: 3px; left: var(--branch-offset, 0px); display: grid; width: 13px; height: 13px; place-items: center; border: 1.5px solid var(--line-strong); border-radius: 50%; background: var(--surface); }
-.current-files-item > .timeline-marker { position: relative; top: auto; left: auto; }
-.timeline-item.current-checkpoint .timeline-marker, .timeline-item.current-files-item .timeline-marker { border-color: var(--accent); }
-.timeline-marker span { width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+.timeline-scroll { min-height: 0; flex: 1 1 auto; overflow: auto; overscroll-behavior: contain; }
+.timeline { position: relative; margin: 0; padding: 14px 17px 4px 0; list-style: none; }
+.timeline-graph-layer { position: absolute; z-index: 0; top: 0; left: 0; overflow: visible; pointer-events: none; }
+.timeline-graph-layer path { fill: none; stroke: var(--line-strong); stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.5; }
+.timeline-graph-layer path.graph-edge-active { stroke: var(--accent); stroke-width: 2; }
+.timeline-graph-layer path.graph-edge-halo { stroke: var(--canvas); stroke-width: 5; }
+.timeline-graph-layer circle { fill: var(--surface); stroke: var(--line-strong); stroke-width: 1.6; }
+.timeline-graph-layer circle.graph-node-active { stroke: var(--accent); }
+.timeline-graph-layer circle.graph-node-current { stroke: var(--accent); stroke-width: 2; }
+.timeline-graph-layer circle.graph-node-dot { fill: var(--accent); stroke: none; }
+.timeline-item { position: relative; z-index: 1; display: block; min-height: 98px; padding-left: max(96px, var(--timeline-graph-width, 96px)); }
 .timeline-content { min-width: 0; flex: 1; padding-bottom: 17px; }
 .timeline-title-row { display: flex; gap: 8px; align-items: center; }
 .timeline-title-row h3 { overflow: hidden; margin: 0; color: var(--ink-strong); font-size: 15px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
